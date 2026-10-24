@@ -1,8 +1,8 @@
 """Vigil catalog surface, routing, metering and BYOK precedence.
 
-Vigil sells four tools (three SEC and congressional disclosure datasets plus
-a free ticker-CIK probe) through treg's normal platform access (treg bills its
-own users from its own Vigil key), with an optional org BYOK key that — when
+Vigil sells twelve tools (SEC and congressional disclosure datasets, 13F fund
+tools, plus a free ticker-CIK probe) through treg's normal platform access
+(treg bills its own users from its own Vigil key), with an optional org BYOK key that — when
 present — takes precedence and leaves the treg balance untouched. The
 ticker-CIK probe is free but still keyed: it never serves anonymously.
 
@@ -28,6 +28,29 @@ INSIDER = "vigil.stocks.insider-trades"                # GET /v1/insider-trades,
 INSIDER_PARAMS = {"ticker": "NVDA", "side": "sell", "limit": 1}
 INTENT = "vigil.stocks.insider-intent"                 # GET /v1/insider-intent, $0.02
 PROBE = "vigil.stocks.reference.ticker-cik"           # GET /v1/reference/ticker-cik, free but keyed
+
+FUNDS_SEARCH = "vigil.funds.search"                    # GET /v1/funds, $0.01
+FUND_PROFILE = "vigil.funds.profile"                   # GET /v1/fund, $0.01
+FUND_FILINGS = "vigil.funds.filings"                   # GET /v1/fund-filings, $0.01
+FUND_HOLDINGS = "vigil.funds.holdings"                 # GET /v1/holdings-13f, $0.01
+FUND_CHANGES = "vigil.funds.changes"                   # GET /v1/holding-changes-13f, $0.01
+POSITION_HISTORY = "vigil.funds.position-history"      # GET /v1/fund-position-history, $0.01
+NEW_POSITIONS = "vigil.funds.new-positions"            # GET /v1/new-13f-positions, $0.01
+COMPARE_FILINGS = "vigil.funds.compare-filings"        # GET /v1/compare-13f-filings, $0.01
+
+FUND_TOOLS = {
+    FUNDS_SEARCH: ("/v1/funds", {"q": "BERKSHIRE", "limit": 1}),
+    FUND_PROFILE: ("/v1/fund", {"cik": "1067983"}),
+    FUND_FILINGS: ("/v1/fund-filings", {"cik": "1067983", "limit": 1}),
+    FUND_HOLDINGS: ("/v1/holdings-13f", {"cik": "1067983", "limit": 1}),
+    FUND_CHANGES: ("/v1/holding-changes-13f", {"cik": "1067983", "limit": 1}),
+    POSITION_HISTORY: ("/v1/fund-position-history",
+                       {"cik": "1067983", "ticker": "NVDA", "limit": 1}),
+    NEW_POSITIONS: ("/v1/new-13f-positions", {"limit": 1}),
+    COMPARE_FILINGS: ("/v1/compare-13f-filings",
+                      {"cik": "1067983", "current_accession": "0001193125-26-352200",
+                       "baseline_accession": "0001193125-26-226661", "limit": 1}),
+}
 
 PLATFORM_KEY = "PLATFORM-VIGIL-KEY"  # synthetic, never a real credential
 OWN_KEY = "OWN-VIGIL-KEY"            # synthetic org BYOK key
@@ -285,3 +308,105 @@ def test_vigil_answers_are_never_cached():
 
     doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "src/treg/catalog/vigil.yaml").read_text())
     assert doc.get("cache") == "forbidden"
+
+
+async def test_platform_fund_calls_bill_one_cent_each(clients, vigil_on, monkeypatch):
+    """All eight fund tools settle $0.01 (10000 micro-USD) on the platform key."""
+    for tool, (path, params) in FUND_TOOLS.items():
+        seen: list = []
+        await _platform_vendor(clients, monkeypatch, seen, {"items": []})
+        before = await _balance(clients)
+        response = await clients.get(f"/call/{tool}", params=params)
+        assert response.status_code == 200, (tool, response.text)
+        assert response.headers["X-Treg-Cost-Micro"] == "10000", tool
+        assert await _balance(clients) == before - 10_000, tool
+        (request,) = seen
+        assert request.url.path == path, tool
+        assert request.headers["x-vigil-key"] == PLATFORM_KEY, tool
+
+
+async def test_fund_paid_empty_200_still_bills(clients, vigil_on, monkeypatch):
+    seen: list = []
+    await _platform_vendor(clients, monkeypatch, seen, {"items": []})
+    before = await _balance(clients)
+    response = await clients.get(f"/call/{FUND_HOLDINGS}",
+                                 params={"cik": "1067983", "limit": 1})
+    assert response.status_code == 200, response.text
+    assert response.headers["X-Treg-Cost-Micro"] == "10000"
+    assert await _balance(clients) == before - 10_000
+
+
+async def test_fund_byok_wins_and_leaves_the_treg_balance_alone(
+    clients, vigil_on, monkeypatch,
+):
+    """A connected org key takes precedence on fund tools: zero treg charge."""
+    await clients.post("/secrets", json={"name": "vigil", "value": OWN_KEY})
+    seen: list = []
+    await _platform_vendor(clients, monkeypatch, seen, {"items": []})
+    before = await _balance(clients)
+    response = await clients.get(f"/call/{COMPARE_FILINGS}",
+                                 params={"cik": "1067983",
+                                         "current_accession": "0001193125-26-352200",
+                                         "baseline_accession": "0001193125-26-226661",
+                                         "limit": 1})
+    assert response.status_code == 200, response.text
+    assert "X-Treg-Cost-Micro" not in response.headers
+    assert await _balance(clients) == before
+    assert seen[0].headers["x-vigil-key"] == OWN_KEY
+
+
+async def test_fund_upstream_errors_leave_the_balance_alone(
+    clients, vigil_on, monkeypatch,
+):
+    seen: list = []
+    await _platform_vendor(clients, monkeypatch, seen, {"error": "boom"}, status=500)
+    before = await _balance(clients)
+    response = await clients.get(f"/call/{NEW_POSITIONS}", params={"limit": 1})
+    assert response.status_code == 500, response.text
+    assert await _balance(clients) == before
+
+
+async def test_fund_upstream_errors_include_coverage_404(
+    clients, vigil_on, monkeypatch,
+):
+    """A pre-2021 period is an unbilled 404 period_outside_coverage, relayed as 404."""
+    seen: list = []
+    await _platform_vendor(
+        clients, monkeypatch, seen, {"detail": "period_outside_coverage"}, status=404)
+    before = await _balance(clients)
+    response = await clients.get(
+        f"/call/{FUND_HOLDINGS}",
+        params={"cik": "1067983", "period": "2020-12-31", "limit": 1})
+    assert response.status_code == 404, response.text
+    assert await _balance(clients) == before
+    (request,) = seen
+    assert request.url.params["period"] == "2020-12-31"
+
+
+def _row_text(endpoint_id: str) -> tuple[str, str]:
+    """(all human-readable text on the row, the cost note)."""
+    ep = catalog_store.load().by_id[endpoint_id]
+    parts = [ep["summary"], (ep.get("input") or {}).get("note") or ""]
+    parts += [p.get("note") or "" for p in ep["input"]["queryParams"].values()]
+    cost_note = ep["cost"].get("note") or ""
+    parts.append(cost_note)
+    return " ".join(parts), cost_note
+
+
+def test_fund_tools_state_coverage_floor_and_new_positions_window():
+    for tool in FUND_TOOLS:
+        text, _ = _row_text(tool)
+        assert "2021-03-31" in text, f"{tool} does not state the 2021-03-31 coverage floor"
+    for tool in FUND_TOOLS:
+        if tool == FUNDS_SEARCH:
+            continue
+        text, cost_note = _row_text(tool)
+        assert "period_outside_coverage" in text, f"{tool} omits period_outside_coverage"
+        assert "period_outside_coverage" in cost_note, (
+            f"{tool} cost note omits that period_outside_coverage is unbilled")
+    text, _ = _row_text(NEW_POSITIONS)
+    assert "newest 4 calendar quarter-ends" in text
+    for tool in (CONGRESSIONAL, INSIDER, INTENT, PROBE):
+        text, _ = _row_text(tool)
+        assert "2021-03-31" not in text, tool
+        assert "period_outside_coverage" not in text, tool
