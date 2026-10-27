@@ -37,6 +37,7 @@ FUND_CHANGES = "vigil.funds.changes"                   # GET /v1/holding-changes
 POSITION_HISTORY = "vigil.funds.position-history"      # GET /v1/fund-position-history, $0.01
 NEW_POSITIONS = "vigil.funds.new-positions"            # GET /v1/new-13f-positions, $0.01
 COMPARE_FILINGS = "vigil.funds.compare-filings"        # GET /v1/compare-13f-filings, $0.01
+HOLDERS = "vigil.stocks.institutional-holders"         # GET /v1/institutional-holders, $0.01
 
 FUND_TOOLS = {
     FUNDS_SEARCH: ("/v1/funds", {"q": "BERKSHIRE", "limit": 1}),
@@ -50,6 +51,7 @@ FUND_TOOLS = {
     COMPARE_FILINGS: ("/v1/compare-13f-filings",
                       {"cik": "1067983", "current_accession": "0001193125-26-352200",
                        "baseline_accession": "0001193125-26-226661", "limit": 1}),
+    HOLDERS: ("/v1/institutional-holders", {"ticker": "NVDA", "limit": 1}),
 }
 
 PLATFORM_KEY = "PLATFORM-VIGIL-KEY"  # synthetic, never a real credential

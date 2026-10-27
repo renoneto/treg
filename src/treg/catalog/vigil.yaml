@@ -220,6 +220,28 @@ endpoints:
     cost: {type: per_success, value: 0.01, currency: USD, per: 1, unit: call, source: docs, source_url: "https://renolabshq.com/vigil/api", checked: '2026-10-19', confidence: documented, note: "Every HTTP 200 bills the full rate, including zero-row 200s. Errors never bill, including 404 period_outside_coverage and 503 data_not_ready. Paid keys need expanded-terms consent."}
     docs_url: https://renolabshq.com/vigil/api
 
+  - id: vigil.stocks.institutional-holders
+    added: '2026-10-27'
+    domain: stocks
+    capability: stocks.institutional-holdings.list
+    platform: stocks
+    scope: any_account
+    method: GET
+    path: /v1/institutional-holders
+    name: "13F institutional holders of a ticker"
+    summary: "Which 13F managers hold a US ticker, from each manager's latest eligible filing (or one quarter), largest value first; options and share classes stay separate, values in whole USD"
+    input:
+      note: "Coverage: 13F report periods from 2021-03-31. An explicit period before 2021-03-31 returns 404 period_outside_coverage (unbilled); the default selection uses each manager's latest eligible filing and skips pre-2021 filings."
+      queryParams:
+        ticker: {type: string, required: true, note: "US stock ticker", example: NVDA}
+        period: {type: string, required: false, note: "quarter-end date YYYY-MM-DD, 2021-03-31 or later; default each manager's latest eligible filing"}
+        exclude_passive: {type: boolean, required: false, note: "drop passive index managers; default false"}
+        limit: {type: integer, required: false, min: 1, max: 100, note: "default 20"}
+        cursor: {type: string, required: false, note: "opaque cursor from the response next_cursor; pass back verbatim"}
+    test_request: {queryParams: {ticker: NVDA, limit: 1}}
+    cost: {type: per_success, value: 0.01, currency: USD, per: 1, unit: call, source: docs, source_url: "https://renolabshq.com/vigil/api", checked: '2026-10-27', confidence: documented, note: "Every HTTP 200 bills the full rate, including zero-row 200s. Errors never bill, including 404 period_outside_coverage and 503 data_not_ready. Paid keys need expanded-terms consent."}
+    docs_url: https://renolabshq.com/vigil/api
+
   - id: vigil.funds.position-history
     added: '2026-10-19'
     domain: stocks
