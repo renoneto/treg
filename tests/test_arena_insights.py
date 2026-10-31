@@ -326,3 +326,22 @@ async def test_prune_runs_during_a_backlog_and_clears_superseded_versions(client
     async with session_maker() as db:
         assert await db.get(ArenaInsightState, "superseded") is None
     assert (await service.public_snapshot(session_maker))["rows"][0]["unique_requests"] == 2
+
+
+async def test_rollback_after_prune_rebuilds_before_publishing(clients, monkeypatch):
+    await record("first", response={"data": {"email": "found@example.test"}})
+    cat, endpoints, version = service._catalog()
+    monkeypatch.setattr(service, "_catalog", lambda: (cat, endpoints, "rolled-back"))
+    assert not await service.collect_batch(session_maker)
+    published = await service.public_snapshot(session_maker)
+    assert published["rows"][0]["unique_requests"] == 1
+
+    monkeypatch.setattr(service, "_catalog", lambda: (cat, endpoints, version))
+    await service.prune(session_maker)
+    async with session_maker() as db:
+        old = await db.get(ArenaInsightState, "rolled-back")
+        assert old.cursor == 0 and old.updated_at is None and old.payload["rows"] == published["rows"]
+
+    monkeypatch.setattr(service, "_catalog", lambda: (cat, endpoints, "rolled-back"))
+    assert not await service.collect_batch(session_maker)
+    assert (await service.public_snapshot(session_maker))["rows"][0]["unique_requests"] == 1

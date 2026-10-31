@@ -19,7 +19,7 @@ import zlib
 from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
-from sqlalchemy import Integer, String, case, column, delete, func, select, values
+from sqlalchemy import Integer, String, case, column, delete, func, select, update, values
 
 from ..domain import arena, arena_insights as rules
 from .. import archive_bodies
@@ -48,9 +48,6 @@ def _catalog():
 
 
 def _version() -> str:
-    # Only the classification rules name a cursor. The catalog changes several times a day; keying
-    # on it restarted the 30-day walk each time, so the walk never finished and nothing published.
-    # The endpoint set is applied when aggregating instead.
     return hashlib.sha256(json.dumps([rules.RULES_VERSION, arena.VERSION]).encode()).hexdigest()
 
 
@@ -307,7 +304,8 @@ async def prune(session_factory=session_maker) -> None:
 
     Runs every pass, backlog or not: tying it to publication let the table grow without bound
     while a backfill was unfinished. A superseded state row is kept until the current version has
-    published, because `public_snapshot` falls back to it until then.
+    published, because `public_snapshot` falls back to it until then; its cursor is reset with its
+    facts, so a rolled-back collector rebuilds them instead of publishing over the payload.
     """
     _, _, version = _catalog()
     O = ArenaObservation
@@ -318,6 +316,9 @@ async def prune(session_factory=session_maker) -> None:
         stale = (await db.execute(select(ArenaInsightState.id).where(ArenaInsightState.id != version))).scalars().all()
         if stale:
             await db.execute(delete(O).where(O.version.in_(stale)))
+            await db.execute(update(ArenaInsightState).where(ArenaInsightState.id.in_(stale),
+                (ArenaInsightState.cursor != 0) | ArenaInsightState.updated_at.is_not(None))
+                .values(cursor=0, updated_at=None, scan_until=now() - timedelta(seconds=60)))
             if state and state.payload.get("status") == "ready":
                 await db.execute(delete(ArenaInsightState).where(ArenaInsightState.id.in_(stale)))
         await db.commit()
