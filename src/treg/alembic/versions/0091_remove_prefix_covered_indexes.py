@@ -69,7 +69,8 @@ _STATE = sa.text("""
 def _sqlite_leading(bind, table: str, name: str) -> str | None:
     inspector = sa.inspect(bind)
     for found in [*inspector.get_indexes(table), *inspector.get_unique_constraints(table)]:
-        if found["name"] == name and found["column_names"]:
+        # A partial survivor (`sqlite_where`) does not serve every lookup on its leading column.
+        if found["name"] == name and found["column_names"] and not found.get("dialect_options"):
             return found["column_names"][0]
     return None
 

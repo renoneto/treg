@@ -52,6 +52,25 @@ async def test_drop_keeps_every_covering_index_and_downgrade_restores_the_droppe
     assert await _names() == after
 
 
+@pytest.mark.parametrize("survivor", [
+    "ON tagspend (org_id, dim, val, created_at) WHERE val IS NOT NULL",
+    "ON tagspend (dim, org_id, val, created_at)",
+])
+async def test_preflight_refuses_a_survivor_that_no_longer_covers_before_dropping_any_index(
+        at_head, survivor):
+    await db._engine.dispose()
+    await asyncio.to_thread(command.downgrade, _alembic_config(), "0090")
+    async with db._engine.begin() as connection:
+        await connection.execute(sa.text("DROP INDEX ix_tagspend_org_dim_val_created"))
+        await connection.execute(sa.text(f"CREATE INDEX ix_tagspend_org_dim_val_created {survivor}"))
+    before = await _names()
+
+    await db._engine.dispose()
+    with pytest.raises(RuntimeError, match="Refusing index migration"):
+        await asyncio.to_thread(command.upgrade, _alembic_config(), "0091")
+    assert await _names() == before
+
+
 async def test_upgrade_is_a_no_op_after_an_out_of_band_drop(at_head):
     await db._engine.dispose()
     await asyncio.to_thread(command.downgrade, _alembic_config(), "0090")
