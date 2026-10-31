@@ -113,7 +113,7 @@ endpoints:
     method: POST
     path: /scrape
     body_allowlist: true
-    name: Scrape or crawl a web page to clean Markdown for LLMs
+    name: Scrape or read a web page as clean Markdown, HTML or PDF
     summary: "Scrape one URL, a web page or a PDF, into clean, LLM-ready Markdown text and/or HTML. Crawl4AI picks the cheapest engine that works (archive, plain fetch, real browser that renders JavaScript), with optional links, media, metadata and tables; proxies for sites that block datacenters."
     input:
       bodyType: json
@@ -149,7 +149,7 @@ endpoints:
     scope: any_account
     method: GET
     path: /search
-    name: "Search the web: live ranked results with title, URL, snippet"
+    name: "Web search engine results for a query: title, URL, snippet"
     summary: "Live web search across several engines, ranked and cleaned: each result has a title, URL and snippet. When the live web returns fewer than 10 results, results from the Crawl4AI index fill the list. For follow-up questions, related queries and an entity card, use crawl4ai.web.search.rich."
     input:
       queryParams:
@@ -212,7 +212,7 @@ endpoints:
     method: POST
     path: /extract
     body_allowlist: true
-    name: Extract structured JSON data from a web page with an LLM
+    name: "Extract structured data from a web page (contact, JSON)"
     summary: "Scrape a page (crawled for you) or read your own content, and return typed JSON matching a JSON schema and/or a plain-English instruction, extracted by an LLM."
     input:
       bodyType: json
@@ -254,7 +254,7 @@ endpoints:
     path: /answer
     # The answer service was rebuilt on 2026-10-07; calls before that measured the old one.
     observed_from: '2026-10-08'
-    name: "Answer a question from the web, prose or JSON"
+    name: "Web search answer with sources and citations (research)"
     summary: "Answers a question or a whole agent prompt (up to 4,000 characters) from the web's current top results, with the pages it drew on. Ask for JSON in the question, or pass a JSON Schema, and the answer is JSON of that shape. answer.source says whether the text is Google's own answer (google_ai_mode, google_ai_overview) or written from the pages (crawl4ai). answered is false, and free, when the pages hold no answer. Experimental: fields may be added."
     input:
       queryParams:
@@ -289,7 +289,7 @@ endpoints:
     scope: any_account
     method: GET
     path: /answer
-    name: "Google AI Mode answer for a question (text only)"
+    name: Google AI Mode answer with citations for a question
     summary: "Google's own AI Mode / AI Overview answer for a question, word for word, with answer.source naming which. deep must be 0, so the text is never written by another model; answered is false, and free, when Google shows no direct answer. Text only: no product, place or ad cards."
     strict_query: true
     input:
@@ -324,7 +324,7 @@ endpoints:
     scope: any_account
     method: GET
     path: /serp
-    name: "Google organic results with true rank and page blocks"
+    name: "Google search results (SERP): organic rank, AI overview"
     summary: "One Google results page as JSON: every organic result with its rank (position, and position_absolute counting the blocks above it), and each block Google showed (People also ask, local pack, videos, ...; the AI Overview when Google showed one: always with source=google, otherwise only when the answer came from Google directly, see note). Localised to a country, a language and optionally a city. When results is empty, empty_reason says why: google_no_results (Google matched nothing) or rescue_no_results (another provider may still have results)."
     strict_query: true
     input:
