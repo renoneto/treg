@@ -31,6 +31,7 @@ sources:
   - src/treg/alembic/versions/0053_idempotentcall_membership_expires_index.py
   - src/treg/alembic/versions/0054_callrecord_org_id_id.py
   - src/treg/alembic/versions/0061_remove_redundant_unique_indexes.py
+  - src/treg/alembic/versions/0091_remove_prefix_covered_indexes.py
   - src/treg/alembic/versions/0034_managed_api_keys.py
   - src/treg/alembic/versions/0035_default_key_generation.py
   - src/treg/alembic/versions/0036_activity_key_indexes.py
@@ -688,6 +689,16 @@ replacement before dropping anything and refuses unexpected definitions or an un
 PostgreSQL drops each index concurrently in an autocommit block, with bounded timeouts restored
 afterward. A partial attempt can be retried. Downgrade rebuilds the ordinary indexes concurrently,
 repairing invalid build debris, and needs space for those indexes. No rows or foreign keys change.
+
+Revision `0091` applies the same discipline to single-column indexes that only repeat the leading
+column of a surviving composite index or unique constraint on the same table: `LedgerEntry.org_id`
+(served by `(org_id, created_at)`), `CallRecord.org_id` (`(org_id, created_at)`, `(org_id, id)`),
+`TagSpend.org_id` (`(org_id, dim, val, created_at)`), `ArchiveSnapshot.key_id`
+(`uq_archive_snapshot_version`) and `ArchiveKeyOrg.org_id` (`uq_archive_key_org`). Model metadata no
+longer declares them; the foreign keys stay. Its preflight requires each survivor to be a valid,
+unconditional btree whose first key column is the dropped one. Every drop is `IF EXISTS`, so a
+database whose indexes were dropped out of band with `DROP INDEX CONCURRENTLY IF EXISTS` before the
+deploy only records the revision.
 
 ## Audit writer (`audit.py`)
 

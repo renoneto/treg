@@ -516,7 +516,7 @@ class CallRecord(SQLModel, table=True):
                             sqlite_where=text("api_key_id IS NOT NULL")),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id")
     user_email: str = Field(index=True)
     tool_name: str = Field(index=True)
     method: str
@@ -988,7 +988,7 @@ class LedgerEntry(SQLModel, table=True):
                             sqlite_where=text("kind = 'topup'")))
 
     id: str = Field(primary_key=True)  # uuid4 hex
-    org_id: int = Field(foreign_key="org.id", index=True)
+    org_id: int = Field(foreign_key="org.id")
     block_id: str | None = Field(default=None, index=True)
     # grant | topup | reserve | settle | release
     kind: str = Field(index=True)
@@ -1133,7 +1133,7 @@ class TagSpend(SQLModel, table=True):
     __table_args__ = (Index("ix_tagspend_org_dim_val_created", "org_id", "dim", "val", "created_at"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int = Field(foreign_key="org.id", index=True)
+    org_id: int = Field(foreign_key="org.id")
     dim: str  # the tag key, e.g. "customer"
     val: str  # the tag value, e.g. "cust_8123"
     # The hold this belongs to (== call_id). Kept after settle so a row can be traced back to its call.
@@ -1970,7 +1970,7 @@ class ArchiveSnapshot(SQLModel, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
-    key_id: int = Field(foreign_key="archivekey.id", index=True)
+    key_id: int = Field(foreign_key="archivekey.id")
     version: int = Field(default=1)                # 1..N within the key, newest = max
     status_code: int = Field(default=200)
     media_type: str = Field(default="")
@@ -2009,7 +2009,7 @@ class ArchiveKeyOrg(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("org_id", "key_hash", name="uq_archive_key_org"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int = Field(index=True)
+    org_id: int
     key_hash: str = Field(index=True)
     first_call_at: NaiveUTC = Field(default_factory=_now)
     last_call_at: NaiveUTC = Field(default_factory=_now)
