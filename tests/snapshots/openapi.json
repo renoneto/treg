@@ -279,6 +279,24 @@
         "title": "CapabilityPinIn",
         "type": "object"
       },
+      "CheckoutIn": {
+        "properties": {
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "price_id": {
+            "title": "Price Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan",
+          "price_id"
+        ],
+        "title": "CheckoutIn",
+        "type": "object"
+      },
       "CliApproveIn": {
         "properties": {
           "code": {
@@ -408,6 +426,19 @@
         "title": "DenyRuleIn",
         "type": "object"
       },
+      "DiscoverIn": {
+        "properties": {
+          "email": {
+            "title": "Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "DiscoverIn",
+        "type": "object"
+      },
       "EmailStartIn": {
         "properties": {
           "captcha_token": {
@@ -442,6 +473,19 @@
           "code"
         ],
         "title": "EmailVerifyIn",
+        "type": "object"
+      },
+      "EnforceIn": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "EnforceIn",
         "type": "object"
       },
       "ExtraCredentialIn": {
@@ -534,6 +578,19 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ITContactIn": {
+        "properties": {
+          "email": {
+            "title": "Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "ITContactIn",
         "type": "object"
       },
       "InviteIn": {
@@ -1033,6 +1090,64 @@
           "role"
         ],
         "title": "RoleIn",
+        "type": "object"
+      },
+      "RunIn": {
+        "additionalProperties": false,
+        "description": "A dry run of a folder: the four files plus the inputs. Nothing is stored; every step is\nreal and charged to the maker (HUB-DECISIONS round 4 q10 / round 5 q2: `treg hub run .`).",
+        "properties": {
+          "check": {
+            "additionalProperties": true,
+            "title": "Check",
+            "type": "object"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "maxLength": 50000000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data"
+          },
+          "inputs": {
+            "additionalProperties": true,
+            "title": "Inputs",
+            "type": "object"
+          },
+          "manifest": {
+            "additionalProperties": true,
+            "title": "Manifest",
+            "type": "object"
+          },
+          "readme": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Readme",
+            "type": "string"
+          },
+          "script": {
+            "anyOf": [
+              {
+                "maxLength": 200000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Script"
+          }
+        },
+        "required": [
+          "manifest",
+          "check",
+          "readme"
+        ],
+        "title": "RunIn",
         "type": "object"
       },
       "RunReportIn": {
@@ -1744,96 +1859,6 @@
           "type"
         ],
         "title": "ValidationError",
-        "type": "object"
-      },
-      "treg__api__RunIn": {
-        "properties": {
-          "args": {
-            "default": [],
-            "items": {
-              "type": "string"
-            },
-            "title": "Args",
-            "type": "array"
-          },
-          "timeout_s": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Timeout S"
-          },
-          "tool": {
-            "title": "Tool",
-            "type": "string"
-          }
-        },
-        "required": [
-          "tool"
-        ],
-        "title": "RunIn",
-        "type": "object"
-      },
-      "treg__routers__hub__RunIn": {
-        "additionalProperties": false,
-        "description": "A dry run of a folder: the four files plus the inputs. Nothing is stored; every step is\nreal and charged to the maker (HUB-DECISIONS round 4 q10 / round 5 q2: `treg hub run .`).",
-        "properties": {
-          "check": {
-            "additionalProperties": true,
-            "title": "Check",
-            "type": "object"
-          },
-          "data": {
-            "anyOf": [
-              {
-                "maxLength": 50000000,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Data"
-          },
-          "inputs": {
-            "additionalProperties": true,
-            "title": "Inputs",
-            "type": "object"
-          },
-          "manifest": {
-            "additionalProperties": true,
-            "title": "Manifest",
-            "type": "object"
-          },
-          "readme": {
-            "maxLength": 4000,
-            "minLength": 1,
-            "title": "Readme",
-            "type": "string"
-          },
-          "script": {
-            "anyOf": [
-              {
-                "maxLength": 200000,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Script"
-          }
-        },
-        "required": [
-          "manifest",
-          "check",
-          "readme"
-        ],
-        "title": "RunIn",
         "type": "object"
       }
     }
@@ -3442,6 +3467,71 @@
         "summary": "Admin Referrals"
       }
     },
+    "/admin/shadow": {
+      "get": {
+        "description": "The shadow provider report (application.shadow): per capability and served endpoint, how often\neach side answered, how often they agree, the candidate's speed and cost. Counts only.",
+        "operationId": "admin_shadow_admin_shadow_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "maximum": 30,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Shadow Admin Shadow Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Shadow"
+      }
+    },
     "/admin/share": {
       "get": {
         "description": "Who served each job over the last `minutes` (at most 360). `requests` counts what callers\nasked (direct calls and routed parents, never a routed attempt). `by_provider` credits the\nanswer a caller actually got: a direct call's 2xx that its adapter did not judge a miss\n(`CallRecord.hit` False), and, for a routed call, only the LAST attempt of a parent that\nsucceeded - the attempt whose answer the job returned. An earlier attempt the job moved on\nfrom is not credited, whatever its status: a free provider's body is often streamed without\na `hit` verdict, so its empty 200s would otherwise count. Two reads over an id range.\n\n`teams` counts the same answers per team, so one heavy team cannot stand for the market:\n`total` teams with an answer, `by_provider` teams a provider served, `weighted` each\nprovider's share averaged over teams (every team one vote), and `direct` / `routed` the same\nteam counts for calls that named a provider and for calls treg's job served.",
@@ -4650,6 +4740,191 @@
         "summary": "Auth Revoke Tokens"
       }
     },
+    "/auth/sso/callback": {
+      "get": {
+        "operationId": "sso_callback_auth_sso_callback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Code",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "State",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Error",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Callback"
+      }
+    },
+    "/auth/sso/discover": {
+      "post": {
+        "description": "Email routes a visitor to a connection; only the WorkOS callback can grant access.",
+        "operationId": "sso_discover_auth_sso_discover_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoverIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Discover Auth Sso Discover Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Discover"
+      }
+    },
+    "/auth/sso/idp/start": {
+      "get": {
+        "description": "An Okta app tile supplies a connection hint, then starts our normal checked flow.",
+        "operationId": "sso_idp_start_auth_sso_idp_start_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "connection_id",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Idp Start"
+      }
+    },
+    "/auth/sso/{org_slug}/start": {
+      "get": {
+        "operationId": "sso_start_auth_sso__org_slug__start_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_slug",
+            "required": true,
+            "schema": {
+              "title": "Org Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "return_to",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Return To",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Start"
+      }
+    },
     "/billing": {
       "get": {
         "description": "The org's billing state: whether top-ups are available at all on this deployment, whether\nthere's a Stripe customer and a saved card, the auto-top-up policy + why it's off if it is, and how\nmuch of this month's automatic cap has been used.",
@@ -4788,7 +5063,7 @@
     },
     "/billing/history": {
       "get": {
-        "description": "This team's completed top-ups, newest first, each with its invoice PDF or card receipt.\n\nRead-only in both directions: it moves no money, and the amounts come from our own credit blocks\nrather than from Stripe, so the history can never contradict the balance. Stripe is asked only for\nthe document links, and `stripe_ok: false` says they were unavailable — the payments listed are\nstill correct.",
+        "description": "This team's paged top-ups and SSO invoices, newest first, with document links.",
         "operationId": "billing_history_billing_history_get",
         "parameters": [
           {
@@ -4801,6 +5076,27 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "title": "Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 2048,
+              "title": "Cursor",
+              "type": "string"
             }
           },
           {
@@ -6902,10 +7198,10 @@
     },
     "/demo/sandbox": {
       "post": {
-        "description": "Mint a login-free, short-lived sandbox TEAM for the landing-page studio: a throwaway org + a\nstarter secret + a starter endpoint + a member token, returned so the browser (and the visitor's\nterminal) can register more, call them, and export a skill — all with no account. Sandbox calls\nnever touch the network (see call_tool → sandbox.synthesize); rate-limited per IP; GC'd after the\nTTL. No auth — this is the anonymous front door.",
+        "description": "The landing sandbox is closed: no new sandbox is minted.",
         "operationId": "demo_sandbox_mint_demo_sandbox_post",
         "responses": {
-          "200": {
+          "410": {
             "content": {
               "application/json": {
                 "schema": {
@@ -7327,6 +7623,69 @@
         "summary": "Run Health"
       }
     },
+    "/home": {
+      "get": {
+        "description": "Bare `treg` in one round trip. A member (an agent key included) answers in full; a signed-in\nuser whose team does not resolve (none created or chosen yet, or one they have left) answers\nwith `team: null`; every other refusal (an invalid token, a suspended account or team, SSO) is\nrefused as everywhere else, so the CLI can say which.",
+        "operationId": "home_home_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Home Home Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Home"
+      }
+    },
     "/hub/run": {
       "post": {
         "operationId": "run_hub_folder_hub_run_post",
@@ -7366,7 +7725,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/treg__routers__hub__RunIn"
+                "$ref": "#/components/schemas/RunIn"
               }
             }
           },
@@ -9414,7 +9773,7 @@
     },
     "/orgs/{org_id}/agents/observed": {
       "get": {
-        "description": "The agents ALREADY running under members' own tokens, discovered from traffic: one row per\n(member, runtime) seen in the last 30 days, e.g. \"sam@… / claude-code\". The zero-setup half\nof the agents story — nobody mints anything, the roster fills itself from `CallRecord.client`\n(and RunRecord). Self-reported attribution, not authentication, which is why this view only\ninforms; scoping one for real = mint it a token (\"Scope this agent\" in the dashboard).\n\nMachine identities are excluded — their calls are already attributed to themselves. So is a\nplain terminal (`client` in ('', 'cli')): a roster that lists every human twice teaches nothing.",
+        "description": "The agents ALREADY running under members' own tokens, discovered from traffic: one row per\n(member, runtime) seen in the last 30 days, e.g. \"sam@… / claude-code\". The zero-setup half\nof the agents story — nobody mints anything, the roster fills itself from `CallRecord.client`\n(and RunRecord). Self-reported attribution, not authentication, which is why this view only\ninforms; scoping one for real = mint it a token (\"Scope this agent\" in the dashboard).\n\nMachine identities are excluded — their calls are already attributed to themselves. So is a\nplain terminal (`client` in ('', 'cli')): a roster that lists every human twice teaches nothing.\n\nCalls come from the daily usage rollup (`application/call_usage.py`), so the window starts at a\nUTC midnight; the roster is empty while the rollup's first backfill runs, and reads the audit\ntable itself only where the rollup worker has never run.",
         "operationId": "list_observed_agents_orgs__org_id__agents_observed_get",
         "parameters": [
           {
@@ -12850,6 +13209,622 @@
         "summary": "Set Org Settings"
       }
     },
+    "/orgs/{org_id}/sso": {
+      "get": {
+        "operationId": "sso_status_orgs__org_id__sso_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Status Orgs  Org Id  Sso Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Status"
+      }
+    },
+    "/orgs/{org_id}/sso/blocked": {
+      "get": {
+        "operationId": "sso_blocked_members_orgs__org_id__sso_blocked_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Blocked Members Orgs  Org Id  Sso Blocked Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Blocked Members"
+      }
+    },
+    "/orgs/{org_id}/sso/blocked/{user_id}/restore": {
+      "post": {
+        "operationId": "sso_restore_member_orgs__org_id__sso_blocked__user_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Restore Member Orgs  Org Id  Sso Blocked  User Id  Restore Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Restore Member"
+      }
+    },
+    "/orgs/{org_id}/sso/cancel": {
+      "post": {
+        "operationId": "sso_cancel_orgs__org_id__sso_cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Cancel Orgs  Org Id  Sso Cancel Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Cancel"
+      }
+    },
+    "/orgs/{org_id}/sso/checkout": {
+      "post": {
+        "operationId": "sso_checkout_orgs__org_id__sso_checkout_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Checkout Orgs  Org Id  Sso Checkout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Checkout"
+      }
+    },
+    "/orgs/{org_id}/sso/enforce": {
+      "post": {
+        "operationId": "sso_enforce_orgs__org_id__sso_enforce_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnforceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Enforce Orgs  Org Id  Sso Enforce Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Enforce"
+      }
+    },
+    "/orgs/{org_id}/sso/invite-it": {
+      "post": {
+        "operationId": "sso_invite_it_orgs__org_id__sso_invite_it_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ITContactIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Invite It Orgs  Org Id  Sso Invite It Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Invite It"
+      }
+    },
+    "/orgs/{org_id}/sso/setup/{intent}": {
+      "post": {
+        "operationId": "sso_setup_orgs__org_id__sso_setup__intent__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "title": "Org Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "intent",
+            "required": true,
+            "schema": {
+              "title": "Intent",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-treg-org",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "X-Treg-Org",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "treg_session",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Treg Session",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sso Setup Orgs  Org Id  Sso Setup  Intent  Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sso Setup"
+      }
+    },
     "/orgs/{org_id}/tag-keys": {
       "get": {
         "description": "Every tag key this team has actually SENT, plus the ones it may budget on.\n\nTwo different questions that had been given one answer. Reporting works on ANY key — the money\nfor an undeclared one is folded in Python — while ENFORCEMENT only works on a declared key,\nbecause it needs an index. Feeding a reporting picker the declared list hid `feature=` and\nfriends from the dashboard even though the API served them fine.",
@@ -13458,52 +14433,10 @@
     },
     "/run": {
       "post": {
-        "description": "Run a tool's CLI **on the treg server**, with its `cli.inject` secrets injected into the\nchild process — the caller never holds the key. Both run tiers read the same `Tool.cli`\nprofile; any tool WITH a profile is server-runnable (no per-tool opt-in — unlike the local\ntier, the key never reaches the member, and the bin allow-list still gates what executes).\nSee docs/CLI-RUN-PLAN.md.\n\nmember+ (executing argv server-side is a register-tier capability, not a read); the sandbox is\nexcluded (it never touches the real world). A non-zero CLI exit is a normal 200 result with\n`exit_code` set; only a failure to *start* (not enabled / CLI absent) is a 4xx.",
+        "description": "Server-side CLI execution is disabled for every caller.",
         "operationId": "run_tool_server_run_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "x-treg-token",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Treg-Token",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-treg-org",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "X-Treg-Org",
-              "type": "string"
-            }
-          },
-          {
-            "in": "cookie",
-            "name": "treg_session",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "Treg Session",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/treg__api__RunIn"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
-          "200": {
+          "503": {
             "content": {
               "application/json": {
                 "schema": {
@@ -13514,16 +14447,6 @@
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
         "summary": "Run Tool Server"
@@ -14123,30 +15046,6 @@
           }
         },
         "summary": "Import Skill Folder"
-      }
-    },
-    "/skills/samples": {
-      "get": {
-        "description": "The hosted sample skills the landing offers — each with its files (SKILL.md/treg.json/.secret)\nand the prompt to try. Public: the landing renders these as file packages.",
-        "operationId": "skill_samples_skills_samples_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "title": "Response Skill Samples Skills Samples Get",
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Skill Samples"
       }
     },
     "/tools": {

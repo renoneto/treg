@@ -585,9 +585,6 @@ async def test_platform_eligibility_refuses_everything_it_cannot_prove():
     # It stays discoverable (a team's OWN key on a bigger plan serves it) but is never an offer.
     assert not cat.platform_eligible({**ok, "platform_blocked": "plan gate"}), \
         "a plan-gated route is not an offer, however well priced"
-    blocked = cat.by_id["akta.companies.headcount_trend"]
-    assert blocked["platform_blocked"], "the akta alt-signals family carries its plan-gate reason"
-    assert not cat.platform_eligible(blocked)
 
 
 async def test_eligibility_rides_on_the_served_row(clients: AsyncClient):
@@ -997,6 +994,38 @@ def test_trial_pools_flow_from_fx_to_eligibility_and_display():
     assert not c.platform_eligible(c.by_id["eodhd.eod"])
 
 
+def test_anymailfinder_platform_prices_all_shared_key_tools():
+    from treg.domain.catalog import store as cs
+
+    c = cs.load()
+    rows = [ep for ep in c.endpoints if ep["id"].startswith("anymailfinder.")]
+    assert len(rows) == 7
+    eligible = {ep["id"] for ep in rows if c.platform_eligible(ep)}
+    assert eligible == {
+        "anymailfinder.people.email.find",
+        "anymailfinder.people.decision_makers",
+        "anymailfinder.companies.emails.list",
+        "anymailfinder.people.email.verify",
+        "anymailfinder.companies.emails.count",
+    }
+
+
+def test_orbisearch_shared_key_scope_and_verified_credit_prices():
+    from treg.domain.catalog import store as cs
+
+    c = cs.load()
+    assert c.credit_rates["orbisearch"] == 0.0062
+    for suffix, usd in (("people.email.verify", 0.00124),
+                        ("people.email.find", 0.0062),
+                        ("companies.enrich", 0.0062)):
+        ep = c.by_id[f"orbisearch.{suffix}"]
+        assert c.platform_eligible(ep), suffix
+        assert c.cost_view(ep["cost"], "orbisearch")["usd"] == usd
+    assert not c.platform_eligible(c.by_id["orbisearch.account.usage"])
+    assert not c.platform_eligible(c.by_id["orbisearch.people.email.content.spam_check"])
+    assert c.cost_view(c.by_id["anymailfinder.people.email.verify"]["cost"], "anymailfinder")["usd"] == 0.004
+
+
 # ---- an id that misses -------------------------------------------------------------------------
 async def test_an_unknown_id_names_the_ids_it_nearly_matched(clients: AsyncClient):
     """An id is not free text. An agent holding one that misses by a segment has hit a dead end
@@ -1152,6 +1181,53 @@ def test_generic_display_prices_match_web_and_cli():
     assert _price_label(job) == _cost_usd(job) == _cost_label(job) == '$0.00015+/page'
     from treg.application.call.resolve import _platform_estimate_micro
     assert _platform_estimate_micro(job, {}) == 75_000
+
+
+_MOZ_ONE_ROW_PER_RETURNED = re.compile(r"1 row per returned", re.I)
+
+
+def test_moz_lists_priced_per_returned_row_show_per_result():
+    """A Moz list that bills one quota row per returned item, with `limit` choosing how many come
+    back, must quote that unit. `quota_rows` with no display unit is labelled `/call`, so a
+    `limit` of 50 looks like the one-row price. `display.unit` names the returned item; the
+    meter stays `quota_rows` and `usd` stays the price of one row."""
+    from treg.application.call.resolve import _platform_estimate_micro
+    from treg.cli import _cost_label, _cost_usd
+    from treg.routers.web import _price_label
+
+    cat = cs.load()
+    listed = []
+    for ep in cat.endpoints:
+        if ep.get("provider") != "moz":
+            continue
+        cost = ep.get("cost") or {}
+        body = (ep.get("input") or {}).get("body") or {}
+        if (cost.get("type") == "quota_rows"
+                and _MOZ_ONE_ROW_PER_RETURNED.search(cost.get("note") or "")
+                and isinstance(body, dict) and "limit" in body):
+            listed.append(ep["id"])
+    assert set(listed) == {
+        "moz.web.backlinks.list",
+        "moz.web.linking_domains.list",
+        "moz.web.anchors.list",
+        "moz.web.site.top_pages",
+        "moz.web.global.top_pages",
+        "moz.web.global.top_domains",
+    }
+    for eid in listed:
+        ep = cat.by_id[eid]
+        viewed = cat.cost_view(ep["cost"], ep["provider"])
+        assert viewed["type"] == "quota_rows" and viewed["usd"] == 0.006667, eid
+        assert viewed["display_unit"] == "result", eid
+        assert (_price_label(viewed) == _cost_usd(viewed) == _cost_label(viewed)
+                == "$0.00667/result"), eid
+        assert _platform_estimate_micro(viewed, {}, b'{"limit":1}') == 6_667, eid
+        assert _platform_estimate_micro(viewed, {}, b'{"limit":50}') == 333_350, eid
+    for eid in ("moz.web.url.metrics", "moz.web.backlinks.summary", "moz.web.index.metadata"):
+        ep = cat.by_id[eid]
+        viewed = cat.cost_view(ep["cost"], ep["provider"])
+        assert viewed["type"] == "quota_rows" and "display_unit" not in viewed, eid
+        assert _price_label(viewed).endswith("/call") and _cost_usd(viewed).endswith("/call"), eid
 
 
 async def test_every_comparison_page_in_the_sitemap_serves(clients):

@@ -9,6 +9,7 @@ sources:
   - src/treg/application/web_arena_publications.py
   - src/treg/application/web_arena_calls.py
   - src/treg/routers/web_arena.py
+  - src/treg/routers/enterprise_sso.py
   - src/treg/models.py
   - src/treg/alembic/versions/0057_web_arena.py
   - src/treg/alembic/versions/0058_web_arena_call_stats.py
@@ -29,6 +30,11 @@ related:
 ---
 
 # Web Arena
+
+Brave Search stays available through direct catalog calls and routed Web and News Search tools,
+but Web Arena excludes it from Search and News comparisons. Its response-retention rule prevents
+Arena from saving result links for later viewing, so it cannot offer the same comparison as the
+other providers. Existing Brave Arena runs keep only aggregate result counts and quality scores.
 
 `/web-arena` is one standalone Vue page; the old `/web-arena/leaderboard` path redirects there.
 The page shares Enrich Arena's tokens, type, light canvas, fighter sprites, and dialogs, with its
@@ -86,8 +92,9 @@ chip never reorders it. Selected chips carry a teal border and check; chips that
 their logo in color. While the roster is open the logo summary gives way to a live "N of M
 selected" count, and, while some providers are off, an "All providers" switch sits beside Done;
 turning it on selects every provider, then the switch fades away. Starting a run closes the roster. Battle still calls providers in parallel.
-The signup dialog uses Enrich Arena's layout, OAuth availability from `/meta`, email-code
-step, local development code notice, and legal links. After sign-in, Web Arena opens the same
+The signup dialog uses Enrich Arena's layout, OAuth availability from `/meta`, primary email-code
+step, alternate Company SSO mode, local development code notice, and legal links. After sign-in,
+Web Arena opens the same
 shared setup dialog as Enrich Arena: a new user names a team, then chooses an agent and gets
 setup instructions. An OAuth return resumes that setup, and the query draft survives the redirect.
 The team switcher shares Enrich Arena's saved team selection and restores it on reload when the

@@ -32,13 +32,19 @@ burst of concurrent calls that all notice the low balance produces exactly ONE c
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import json
 import logging
+import time
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, update
+from sqlalchemy import and_, delete, func, literal_column, or_, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import select
 
 from .. import adsconv
@@ -49,7 +55,9 @@ from ..domain import money as ledger
 from ..domain import referrals
 from ..config import get_settings
 from ..infra import stripe as stripe_adapter
-from ..models import CreditBlock, LedgerEntry, Membership, Org, User
+from ..models import CreditBlock, EnterpriseSSO, EnterpriseSSOIdentity, EnterpriseDirectoryUser, LedgerEntry, Membership, Org, User
+from ..infra.db import session_maker
+from . import enterprise_sso
 
 
 
@@ -65,6 +73,11 @@ TOPUP_MAX_USD = 2_000
 # any other we add later (required suffix is 8 letters — see Stripe's integration_identifier docs).
 INTEGRATION_ID = "tregtopup-qwkmzhrb"
 AUTH_REQUIRED_CODES = {"authentication_required", "invoice_payment_intent_requires_action"}
+
+
+# Postgres matches the partial topup index (revision 0090) only when the predicate is a constant
+# in the statement; a bound `kind` would let a cached generic plan walk all of a team's rows.
+_TOPUP = literal_column("'topup'")
 
 
 class BillingNotConfigured(Exception):
@@ -148,7 +161,7 @@ async def next_default_usd(db: AsyncSession, org_id: int | None) -> int:
         return int(s.topup_default_usd)
     rows = (await db.execute(
         select(LedgerEntry.amount_micro, LedgerEntry.meta)
-        .where(LedgerEntry.org_id == org_id, LedgerEntry.kind == "topup")
+        .where(LedgerEntry.org_id == org_id, LedgerEntry.kind == _TOPUP)
         .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc()).limit(50)
     )).all()
     last_micro = None
@@ -290,7 +303,7 @@ async def monthly_autotopup_spend(db: AsyncSession, org_id: int) -> int:
     # and the flag is matched in Python. A month's top-ups is a handful of rows, not a scan.
     rows = (await db.execute(
         select(LedgerEntry.amount_micro, LedgerEntry.meta).where(
-            LedgerEntry.org_id == org_id, LedgerEntry.kind == "topup",
+            LedgerEntry.org_id == org_id, LedgerEntry.kind == _TOPUP,
             LedgerEntry.created_at >= _month_start(),
         )
     )).all()
@@ -572,6 +585,7 @@ async def create_portal_session(db: AsyncSession, org: Org, *, return_base: str 
 # trip in `_payment_documents`: a pooled connection must never sit open across an upstream call.
 async def _load_payment_rows(
     db: AsyncSession, org: Org, *, limit: int = 24,
+    before: tuple[datetime, str] | None = None,
 ) -> tuple[list[CreditBlock], set[str], dict[str, int]]:
     """The org's completed top-ups, newest first: DB rows, their auto-topup flags, bonus amounts.
 
@@ -580,13 +594,15 @@ async def _load_payment_rows(
     it needs no network call to render amounts and dates. Read-only: nothing here moves money or
     writes to the ledger.
     """
-    blocks = (await db.execute(
-        select(CreditBlock)
-        .where(CreditBlock.org_id == org.id, CreditBlock.kind == "purchased",
-               CreditBlock.stripe_payment_intent.is_not(None))
-        .order_by(CreditBlock.created_at.desc())
-        .limit(max(1, min(int(limit), 100)))
-    )).scalars().all()
+    query = select(CreditBlock).where(
+        CreditBlock.org_id == org.id, CreditBlock.kind == "purchased",
+        CreditBlock.stripe_payment_intent.is_not(None),
+    )
+    if before:
+        query = query.where(or_(CreditBlock.created_at < before[0],
+                                and_(CreditBlock.created_at == before[0], CreditBlock.id < before[1])))
+    blocks = (await db.execute(query.order_by(CreditBlock.created_at.desc(), CreditBlock.id.desc())
+                               .limit(max(1, min(int(limit), 100))))).scalars().all()
 
     # Which of these top-ups were automatic. The flag lives in the ledger entry's JSON meta, and JSON
     # containment isn't portable across SQLite and Postgres — so the rows are narrowed by block id
@@ -596,7 +612,7 @@ async def _load_payment_rows(
     if blocks:
         rows = (await db.execute(
             select(LedgerEntry.block_id, LedgerEntry.meta).where(
-                LedgerEntry.org_id == org.id, LedgerEntry.kind == "topup",
+                LedgerEntry.org_id == org.id, LedgerEntry.kind == _TOPUP,
                 LedgerEntry.block_id.in_([b.id for b in blocks]),
             )
         )).all()
@@ -683,6 +699,85 @@ async def _payment_documents(org: Org, wanted: int) -> tuple[dict[str, dict], bo
         out[pi] = {"receipt_url": ch.get("receipt_url") or "",
                    **(by_pi.get(pi) or by_invoice.get(inv or "", {}))}
     return out, True
+
+
+async def _subscription_invoices(
+    customer_id: str, org_id: int, subscription_id: str, limit: int, after: str = "",
+) -> tuple[list[dict], bool, bool]:
+    """SSO invoices across renewals and later re-purchases, excluding prepaid invoices.
+
+    Subscription metadata is copied onto invoice subscription details at creation. The current
+    subscription ID also covers an invoice that has not yet received that metadata snapshot.
+    """
+    rows = []
+    payment_intents: dict[str, str] = {}
+    scan_after = after
+    more = False
+    try:
+        while len(rows) < limit:
+            kw = {"customer": customer_id, "limit": 100}
+            if scan_after:
+                kw["starting_after"] = scan_after
+            page = await _sdk(stripe_adapter.INVOICE_LIST, expand=["data.payments"], **kw)
+            invoices = page.get("data") or []
+            for inv in invoices:
+                if not inv.get("id"):
+                    continue
+                details = (inv.get("parent") or {}).get("subscription_details") or inv.get("subscription_details") or {}
+                metadata = details.get("metadata") or {}
+                sub = details.get("subscription") or inv.get("subscription")
+                if (metadata.get("treg_kind") != "enterprise_sso" or metadata.get("treg_org_id") != str(org_id)) and sub != subscription_id:
+                    continue
+                created = inv.get("created")
+                rows.append({
+                    "id": inv["id"],
+                    "number": inv.get("number") or "",
+                    "created_at": datetime.fromtimestamp(created, timezone.utc).isoformat() if isinstance(created, int) else None,
+                    "amount_micro": cents_to_micro(int(inv.get("total") or 0)),
+                    "currency": inv.get("currency") or "usd",
+                    "status": inv.get("status") or "",
+                    "invoice_pdf": inv.get("invoice_pdf") or "",
+                    "hosted_invoice_url": inv.get("hosted_invoice_url") or "",
+                    "receipt_url": "",
+                })
+                if inv.get("status") == "paid":
+                    for entry in (inv.get("payments") or {}).get("data") or []:
+                        payment = entry.get("payment") or {}
+                        pi = payment.get("payment_intent")
+                        pi_id = pi if isinstance(pi, str) else (pi or {}).get("id")
+                        if pi_id:
+                            payment_intents[inv["id"]] = pi_id
+                            break
+                if len(rows) == limit:
+                    break
+            if len(rows) == limit:
+                more = True
+                break
+            if not page.get("has_more") or not invoices or not invoices[-1].get("id") or invoices[-1]["id"] == scan_after:
+                break
+            scan_after = invoices[-1]["id"]
+    except Exception as e:  # noqa: BLE001 — keep the billing page usable during a Stripe outage
+        log.warning("billing: could not load SSO invoices for org %s: %s", org_id, e)
+        return [], False, False
+    # A receipt belongs to the successful Charge, not the Invoice. Query by that invoice's
+    # PaymentIntent so even an older renewal has its own receipt; missing/failed lookups keep the
+    # invoice visible. The semaphore prevents a history page from bursting Stripe with requests.
+    async def receipt_for(row: dict) -> None:
+        pi_id = payment_intents.get(row["id"])
+        if not pi_id:
+            return
+        async with receipt_slots:
+            try:
+                charges = await _sdk(stripe_adapter.CHARGE_LIST, customer=customer_id,
+                                     payment_intent=pi_id, limit=1)
+                row["receipt_url"] = next((charge.get("receipt_url") or ""
+                    for charge in charges.get("data") or [] if charge.get("status") == "succeeded"), "")
+            except Exception as e:  # noqa: BLE001 — a receipt is optional; the invoice remains
+                log.warning("billing: could not load SSO receipt for org %s: %s", org_id, e)
+
+    receipt_slots = asyncio.Semaphore(5)
+    await asyncio.gather(*(receipt_for(row) for row in rows))
+    return rows, True, more
 
 
 # Per-org in-process lock. Cheap first line of defence against a burst of concurrent calls all
@@ -826,7 +921,7 @@ async def _last_auto_credit_at(db: AsyncSession, org_id: int) -> datetime | None
     while True:
         rows = (await db.execute(
             select(LedgerEntry.created_at, LedgerEntry.meta).where(
-                LedgerEntry.org_id == org_id, LedgerEntry.kind == "topup"
+                LedgerEntry.org_id == org_id, LedgerEntry.kind == _TOPUP
             ).order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
             .limit(100).offset(offset)
         )).all()
@@ -1296,10 +1391,9 @@ def verify_event(payload: bytes, signature: str) -> dict:
     """Verify a Stripe webhook signature and return the parsed event. Raises `ValueError` on a bad
     signature or payload.
 
-    Uses the SDK's `verify_header` rather than our own HMAC (the demo feed's `pubfeed.verify_signature`
-    does it by hand): it is the code Stripe maintains, and it already handles the timestamp tolerance
-    that stops a captured delivery being replayed, plus the several-signatures case during secret
-    rotation.
+    Uses the SDK's `verify_header` rather than our own HMAC: it is the code Stripe maintains, and it
+    already handles the timestamp tolerance that stops a captured delivery being replayed, plus the
+    several-signatures case during secret rotation.
 
     Deliberately NOT `construct_event`, which additionally deserializes into the SDK's typed Event
     model and raises on an envelope it doesn't recognize. Authenticity and shape are separate
@@ -1331,6 +1425,8 @@ async def handle_webhook_event(db: AsyncSession, event: dict) -> dict:
     """
     kind = event.get("type") or ""
     obj = ((event.get("data") or {}).get("object") or {})
+    if (obj.get("metadata") or {}).get("treg_kind") == "enterprise_sso":
+        return await handle_event(db, event)
     if kind == "checkout.session.completed":
         return await _on_checkout_completed(db, obj)
     if kind == "payment_intent.succeeded":
@@ -1788,14 +1884,111 @@ async def configure_autotopup(
         return state
 
 
-async def get_payment_history(org_id: int, *, limit: int) -> dict:
-    # The DB session closes before `_payment_documents` calls Stripe below - a pooled connection must
-    # never sit open across an upstream round trip.
+def _history_cursor(data: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def _read_history_cursor(value: str) -> dict:
+    if not value:
+        return {}
+    try:
+        data = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+        if not isinstance(data, dict) or set(data) - {"t", "i", "o"}:
+            raise ValueError("invalid cursor")
+        if data.get("t"):
+            dt, block_id = data["t"]
+            datetime.fromisoformat(dt)
+            if not isinstance(block_id, str):
+                raise ValueError("invalid cursor")
+        if data.get("i") and not isinstance(data["i"], str):
+            raise ValueError("invalid cursor")
+        if data.get("o") and not isinstance(data["o"], int):
+            raise ValueError("invalid cursor")
+        return data
+    except (ValueError, TypeError, KeyError, IndexError, binascii.Error) as e:
+        raise ValueError("invalid billing history cursor") from e
+
+
+async def get_payment_history(org_id: int, *, limit: int, kind: str = "all", cursor: str = "") -> dict:
+    """One newest-first timeline; cursors advance only the source rows actually displayed."""
+    if kind not in {"all", "manual", "auto", "subscription"}:
+        raise ValueError("invalid billing history filter")
+    position = _read_history_cursor(cursor)
+    topup_pos = position.get("t")
+    topup_before = (datetime.fromisoformat(topup_pos[0]), topup_pos[1]) if topup_pos else None
+    stripe_after = position.get("i") or ""
+    page_size = max(1, min(limit, 100))
+    blocks: list[CreditBlock] = []
+    auto: set[str] = set()
+    bonus_by_pi: dict[str, int] = {}
+    # The database connection closes before any Stripe call. Filtered top-up pages scan in bounded
+    # chunks because the auto flag is ledger JSON and must behave identically on SQLite/Postgres.
     async with _db.session_maker() as db:
         org = await _journey_org(db, org_id)
-        blocks, auto, bonus_by_pi = await _load_payment_rows(db, org, limit=limit)
-    docs, stripe_ok = await _payment_documents(org, len(blocks))
-    return _assemble_payments(blocks, auto, bonus_by_pi, docs, stripe_ok)
+        sso = await db.get(EnterpriseSSO, org_id)
+        subscription_id = sso.stripe_subscription_id if sso else None
+        if kind != "subscription":
+            scan_before = topup_before
+            while len(blocks) <= page_size:
+                batch, batch_auto, batch_bonus = await _load_payment_rows(
+                    db, org, limit=100, before=scan_before)
+                if not batch:
+                    break
+                for block in batch:
+                    is_auto = block.id in batch_auto
+                    if kind == "all" or (kind == "auto") == is_auto:
+                        blocks.append(block)
+                        if is_auto:
+                            auto.add(block.id)
+                        if block.stripe_payment_intent in batch_bonus:
+                            bonus_by_pi[block.stripe_payment_intent] = batch_bonus[block.stripe_payment_intent]
+                    if len(blocks) > page_size:
+                        break
+                if len(blocks) > page_size or len(batch) < 100:
+                    break
+                scan_before = (batch[-1].created_at, batch[-1].id)
+
+    invoices: list[dict] = []
+    invoices_ok = True
+    invoices_more = False
+    if kind in {"all", "subscription"} and subscription_id:
+        if org.stripe_customer_id and configured():
+            invoices, invoices_ok, invoices_more = await _subscription_invoices(
+                org.stripe_customer_id, org_id, subscription_id, page_size + 1, stripe_after)
+        else:
+            invoices_ok = False
+    # Document lookup needs only the top-ups that can appear on this page.
+    candidate_blocks = blocks[:page_size]
+    docs, stripe_ok = await _payment_documents(org, len(candidate_blocks))
+    topups = _assemble_payments(candidate_blocks, auto, bonus_by_pi, docs, stripe_ok)["items"]
+    for item, block in zip(topups, candidate_blocks, strict=True):
+        item["kind"] = "auto" if block.id in auto else "manual"
+        item["_position"] = [block.created_at.isoformat(), block.id]
+        item["id"] = block.id
+        item["status"] = "paid"
+    for item in invoices:
+        item["kind"] = "subscription"
+    combined = topups + invoices
+    combined.sort(key=lambda row: (row.get("created_at") or "", row["id"]), reverse=True)
+    shown = combined[:page_size]
+    next_pos = dict(position)
+    for item in shown:
+        if item["kind"] == "subscription":
+            next_pos["i"] = item["id"]
+        else:
+            next_pos["t"] = item["_position"]
+    more = len(combined) > page_size or len(blocks) > page_size or invoices_more
+    # Stripe errors make the mixed ordering unknowable; offer retry, not a misleading next page.
+    if not invoices_ok:
+        more = False
+    for item in shown:
+        item.pop("_position", None)
+    return {
+        "items": shown,
+        "stripe_ok": stripe_ok,
+        "subscription_invoices_ok": invoices_ok,
+        "next_cursor": _history_cursor(next_pos) if more else None,
+    }
 
 
 async def open_billing_portal(org_id: int, *, return_base: str) -> dict:
@@ -1828,3 +2021,338 @@ async def process_webhook(
             # loudly: an event that never succeeds is money someone paid and didn't get.
             log.exception("webhook %s failed: %s", event.get("type"), e)
             raise BillingJourneyError("webhook_failed", "webhook handling failed") from e
+
+
+# Enterprise subscription billing lives alongside the existing Stripe use cases.
+PLANS = {"sso", "sso_directory"}
+ACTIVE = {"active", "trialing"}
+ENTITLED = ACTIVE | {"past_due"}
+
+
+class EnterpriseBillingError(Exception):
+    pass
+
+
+async def catalog() -> list[dict]:
+    settings = get_settings()
+    if not settings.stripe_secret_key:
+        return []
+    plans = []
+    for plan in ("sso", "sso_directory"):
+        if plan == "sso" and settings.enterprise_sso_bundle_only:
+            continue
+        price_id = _enterprise_price_id(plan, settings)
+        if not price_id:
+            continue
+        try:
+            price = await stripe_adapter.call(stripe_adapter.PRICE_RETRIEVE,
+                api_key=settings.stripe_secret_key, id=price_id)
+            amount_cents = _validate_enterprise_price(price, price_id=price_id,
+                minimum_cents=_enterprise_min_price_cents(plan, settings))
+        except (stripe_adapter.StripeError, EnterpriseBillingError):
+            log.warning("SSO plan %s has no usable Stripe Price", plan, exc_info=True)
+            continue
+        plans.append({"id": plan, "price_id": price_id, "usd_monthly_cents": amount_cents,
+                      "directory_sync": plan == "sso_directory"})
+    return plans
+
+
+def _enterprise_price_id(plan: str, settings) -> str:
+    return (settings.enterprise_sso_bundle_price_id if plan == "sso_directory"
+            else settings.enterprise_sso_only_price_id if plan == "sso" else "")
+
+
+def _enterprise_min_price_cents(plan: str, settings) -> int:
+    minimum_usd = (settings.enterprise_sso_bundle_min_price_usd if plan == "sso_directory"
+                   else settings.enterprise_sso_only_min_price_usd)
+    return max(0, minimum_usd) * 100
+
+
+def _validate_enterprise_price(price: dict, *, price_id: str, minimum_cents: int = 0) -> int:
+    recurring = price.get("recurring") or {}
+    amount_cents = price.get("unit_amount")
+    if (price.get("id") != price_id or price.get("active") is not True
+            or price.get("currency") != "usd" or price.get("billing_scheme") != "per_unit"
+            or not isinstance(amount_cents, int) or isinstance(amount_cents, bool) or amount_cents <= 0
+            or recurring.get("interval") != "month" or recurring.get("interval_count", 1) != 1
+            or recurring.get("usage_type") != "licensed"):
+        raise EnterpriseBillingError("SSO Stripe price must be an active flat monthly USD price")
+    if amount_cents < minimum_cents:
+        raise EnterpriseBillingError("SSO Stripe price is below the configured minimum")
+    return amount_cents
+
+
+async def status(org_id: int, *, include_plans: bool = True) -> dict:
+    settings = get_settings()
+    async with session_maker() as db:
+        row = await db.get(EnterpriseSSO, org_id)
+        result = {"configured": bool(settings.workos_api_key and settings.workos_client_id),
+                "billing_configured": bool(settings.stripe_secret_key and settings.stripe_webhook_secret),
+                "plan": row.plan if row else None,
+                "subscription_status": row.subscription_status if row else None,
+                "sso_ready": bool(row and row.connection_id),
+                "directory_ready": bool(row and row.directory_id and row.directory_active),
+                "enforced": bool(row and row.enforced),
+                "cleanup_pending": bool(row and row.subscription_status in {"canceled", "incomplete_expired"}
+                                        and row.workos_org_id and row.workos_cleanup_completed_at is None),
+                "cancel_at_period_end": bool(row and row.cancel_at_period_end)}
+    # Existing subscribers need management even when Stripe's Price API is unavailable. Only
+    # teams shopping for a plan need live sale prices, and no DB connection spans that call.
+    result["plans"] = (await catalog() if include_plans and result["subscription_status"] not in ENTITLED
+                       else [])
+    return result
+
+
+async def start_checkout(org_id: int, plan: str, *, price_id: str, base: str, email: str) -> dict:
+    settings = get_settings()
+    if not settings.stripe_secret_key or not settings.stripe_webhook_secret:
+        raise EnterpriseBillingError("Stripe billing is not configured")
+    if not settings.workos_api_key or not settings.workos_client_id:
+        raise EnterpriseBillingError("WorkOS is not configured")
+    if (plan not in PLANS or (plan == "sso" and settings.enterprise_sso_bundle_only)
+            or not _enterprise_price_id(plan, settings)):
+        raise EnterpriseBillingError("plan is not available")
+    if price_id != _enterprise_price_id(plan, settings):
+        raise EnterpriseBillingError("SSO price changed; refresh the page before checkout")
+    now = int(time.time())
+    checkout_token = uuid4().hex
+    async with session_maker() as db:
+        org = await db.get(Org, org_id)
+        row = await db.get(EnterpriseSSO, org_id)
+        if org is None or org.suspended:
+            raise EnterpriseBillingError("team is unavailable")
+        if row is not None and row.stripe_subscription_id and row.subscription_status not in {"canceled", "incomplete_expired"}:
+            raise EnterpriseBillingError("manage the existing subscription in Billing")
+        if (row is not None and row.subscription_status in {"canceled", "incomplete_expired"}
+                and row.workos_org_id and row.workos_cleanup_completed_at is None):
+            raise EnterpriseBillingError("previous SSO setup is being removed; retry shortly")
+        if row is not None and row.checkout_pending_until > now:
+            if row.checkout_url:
+                return {"url": row.checkout_url}
+            raise EnterpriseBillingError("checkout is being prepared; retry in a moment")
+        customer_id, name, slug = org.stripe_customer_id, org.name, org.slug
+        try:
+            if row is None:
+                db.add(EnterpriseSSO(org_id=org_id, checkout_token=checkout_token,
+                                     checkout_pending_until=now + 1800))
+                await db.commit()
+            else:
+                claimed = await db.execute(update(EnterpriseSSO).where(
+                    EnterpriseSSO.org_id == org_id,
+                    EnterpriseSSO.checkout_pending_until <= now,
+                ).values(checkout_token=checkout_token, checkout_pending_until=now + 1800,
+                         checkout_url=None))
+                if claimed.rowcount != 1:
+                    raise EnterpriseBillingError("checkout is being prepared; retry in a moment")
+                await db.commit()
+        except (IntegrityError, OperationalError) as exc:
+            await db.rollback()
+            raise EnterpriseBillingError("checkout is being prepared; retry in a moment") from exc
+    try:
+        try:
+            price = await stripe_adapter.call(stripe_adapter.PRICE_RETRIEVE,
+                api_key=settings.stripe_secret_key, id=price_id)
+        except stripe_adapter.StripeError as exc:
+            raise EnterpriseBillingError("SSO Stripe price is unavailable") from exc
+        _validate_enterprise_price(price, price_id=price_id,
+            minimum_cents=_enterprise_min_price_cents(plan, settings))
+        if not customer_id:
+            customer = await stripe_adapter.call(stripe_adapter.CUSTOMER_CREATE,
+                api_key=settings.stripe_secret_key, name=name or slug, email=email,
+                metadata={"treg_org_id": str(org_id), "treg_org_slug": slug},
+                idempotency_key=f"enterprise-customer-{org_id}")
+            customer_id = customer["id"]
+            async with session_maker() as db:
+                org = await db.get(Org, org_id)
+                if org is None:
+                    raise EnterpriseBillingError("team is unavailable")
+                if not org.stripe_customer_id:
+                    org.stripe_customer_id = customer_id
+                    db.add(org)
+                    await db.commit()
+                else:
+                    customer_id = org.stripe_customer_id
+        metadata = {"treg_kind": "enterprise_sso", "treg_org_id": str(org_id), "treg_plan": plan}
+        base = base.rstrip("/")
+        session = await stripe_adapter.call(stripe_adapter.CHECKOUT_SESSION_CREATE,
+            api_key=settings.stripe_secret_key, mode="subscription", customer=customer_id,
+            idempotency_key=f"enterprise-checkout-{checkout_token}", expires_at=now + 1800,
+            line_items=[{"quantity": 1, "price": price_id}],
+            metadata=metadata, subscription_data={"metadata": metadata},
+            success_url=f"{base}/app?sso=success#billing",
+            cancel_url=f"{base}/app?sso=cancelled#billing")
+        async with session_maker() as db:
+            row = await db.get(EnterpriseSSO, org_id)
+            if row is None or row.checkout_token != checkout_token:
+                raise EnterpriseBillingError("checkout reservation changed; retry")
+            row.checkout_url = session["url"]
+            db.add(row)
+            await db.commit()
+        return {"url": session["url"]}
+    except Exception:
+        async with session_maker() as db:
+            row = await db.get(EnterpriseSSO, org_id)
+            if row is not None and row.checkout_token == checkout_token:
+                row.checkout_pending_until = 0
+                row.checkout_token = None
+                row.checkout_url = None
+                db.add(row)
+                await db.commit()
+        raise
+
+
+async def cancel_at_period_end(org_id: int) -> dict:
+    settings = get_settings()
+    async with session_maker() as db:
+        row = await db.get(EnterpriseSSO, org_id)
+        if row is None or not row.stripe_subscription_id or row.subscription_status not in ACTIVE:
+            raise EnterpriseBillingError("there is no active SSO subscription")
+        subscription_id = row.stripe_subscription_id
+    if not settings.stripe_secret_key:
+        raise EnterpriseBillingError("Stripe billing is not configured")
+    result = await stripe_adapter.schedule_subscription_cancel(
+        subscription_id, api_key=settings.stripe_secret_key)
+    if result.get("id") != subscription_id or not result.get("cancel_at_period_end"):
+        raise EnterpriseBillingError("Stripe did not schedule cancellation")
+    async with session_maker() as db:
+        row = await db.get(EnterpriseSSO, org_id)
+        if row is not None and row.stripe_subscription_id == subscription_id:
+            row.cancel_at_period_end = True
+            db.add(row)
+            await db.commit()
+    return {"cancel_at_period_end": True}
+
+
+async def handle_event(db, event: dict) -> dict:
+    """Called only after the shared Stripe webhook verifies its signature."""
+    kind = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        return {"handled": False, "type": kind}
+    meta = obj.get("metadata") or {}
+    if meta.get("treg_kind") != "enterprise_sso":
+        return {"handled": False, "type": kind}
+    try:
+        org_id = int(meta["treg_org_id"])
+    except (KeyError, ValueError, TypeError):
+        return {"handled": False, "type": kind}
+    org = await db.get(Org, org_id)
+    if org is None or (obj.get("customer") and obj["customer"] != org.stripe_customer_id):
+        return {"handled": False, "type": kind}
+    row = await db.get(EnterpriseSSO, org_id)
+    try:
+        created = int(event.get("created") or 0)
+    except (TypeError, ValueError):
+        created = 0
+    if row and created and row.stripe_event_created and created < row.stripe_event_created:
+        return {"handled": True, "type": kind, "stale": True}
+    if kind == "checkout.session.completed":
+        subscription_id = obj.get("subscription")
+        plan = meta.get("treg_plan")
+        if obj.get("mode") != "subscription" or not subscription_id or plan not in PLANS:
+            return {"handled": False, "type": kind}
+        if obj.get("payment_status") not in {"paid", "no_payment_required"}:
+            return {"handled": False, "type": kind}
+        if (row and row.stripe_subscription_id and row.stripe_subscription_id != subscription_id
+                and row.subscription_status not in {"canceled", "incomplete_expired"}):
+            raise EnterpriseBillingError("multiple SSO subscriptions for one team")
+        if row and row.stripe_subscription_id == subscription_id and row.subscription_status == "canceled":
+            return {"handled": True, "type": kind, "stale": True}
+        row = row or EnterpriseSSO(org_id=org_id)
+        row.plan = plan
+        row.stripe_subscription_id = subscription_id
+        row.subscription_status = "active"
+        row.cancel_at_period_end = False
+    elif kind in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
+        subscription_id = obj.get("id")
+        plan = meta.get("treg_plan")
+        if not subscription_id or plan not in PLANS:
+            return {"handled": False, "type": kind}
+        if (row and row.stripe_subscription_id and row.stripe_subscription_id != subscription_id
+                and row.subscription_status not in {"canceled", "incomplete_expired"}):
+            return {"handled": False, "type": kind}
+        if row and row.stripe_subscription_id == subscription_id and row.subscription_status == "canceled":
+            return {"handled": True, "type": kind, "stale": True}
+        row = row or EnterpriseSSO(org_id=org_id)
+        row.plan = plan
+        row.stripe_subscription_id = subscription_id
+        row.subscription_status = "canceled" if kind.endswith(".deleted") else str(obj.get("status") or "incomplete")
+        row.cancel_at_period_end = bool(obj.get("cancel_at_period_end"))
+    else:
+        return {"handled": False, "type": kind}
+    row.stripe_event_created = created
+    if row.stripe_subscription_id and row.subscription_status in ENTITLED:
+        row.workos_cleanup_completed_at = None
+        row.checkout_token = None
+        row.checkout_pending_until = 0
+        row.checkout_url = None
+    if row.subscription_status not in ENTITLED and row.enforced:
+        row.enforced = False
+        enterprise_sso._audit(db, org_id, "sso.enforcement_disabled")
+    db.add(row)
+    if row.subscription_status in {"canceled", "incomplete_expired"}:
+        await enterprise_sso.remove_sso_created_memberships(db, org_id)
+    await db.commit()
+    return {"handled": True, "type": kind}
+
+
+async def cleanup_canceled_workos(org_id: int) -> dict:
+    """Remove billable WorkOS resources after entitlement ends, outside any DB transaction.
+
+    A canceled team's WorkOS organization is dedicated to that treg team. Keep the organization
+    for a later purchase, but remove every connection and directory it owns, including resources
+    made in Admin Portal before a first sign-in or activation webhook recorded their IDs here.
+    """
+    import httpx
+    from ..infra import workos
+
+    async with session_maker() as db:
+        row = await db.get(EnterpriseSSO, org_id)
+        if row is None or row.subscription_status not in {"canceled", "incomplete_expired"}:
+            return {"org_id": org_id, "skipped": "subscription is not ended"}
+        if row.workos_cleanup_completed_at is not None:
+            return {"org_id": org_id, "skipped": "already cleaned"}
+        organization = row.workos_org_id
+        subscription_id = row.stripe_subscription_id
+    if organization:
+        key = get_settings().workos_api_key
+        if not key:
+            raise EnterpriseBillingError("WorkOS API key is not configured")
+        async with httpx.AsyncClient() as client:
+            details = await workos.get_organization(client, key=key, organization=organization)
+            if details.get("external_id") != str(org_id):
+                raise EnterpriseBillingError("WorkOS organization does not belong to this team")
+            directories = await workos.directories_for_organization(client, key=key,
+                organization=organization)
+            connections = await workos.connections_for_organization(client, key=key,
+                organization=organization)
+            for kind, rows in (("directory", directories), ("connection", connections)):
+                for resource in rows:
+                    expected = "directory_" if kind == "directory" else "conn_"
+                    if (resource.get("organization_id") != organization or
+                            not isinstance(resource.get("id"), str) or
+                            not resource["id"].startswith(expected)):
+                        raise EnterpriseBillingError("WorkOS resource does not belong to this team")
+            for resource in directories:
+                await workos.delete_directory(client, key=key, directory=resource["id"])
+            for resource in connections:
+                await workos.delete_connection(client, key=key, connection=resource["id"])
+            if (await workos.directories_for_organization(client, key=key, organization=organization)
+                    or await workos.connections_for_organization(client, key=key, organization=organization)):
+                raise EnterpriseBillingError("WorkOS resources remain; retry cleanup")
+    async with session_maker() as db:
+        row = await db.get(EnterpriseSSO, org_id, with_for_update=True)
+        if (row is None or row.subscription_status not in {"canceled", "incomplete_expired"}
+                or row.stripe_subscription_id != subscription_id or row.workos_org_id != organization):
+            raise EnterpriseBillingError("SSO subscription changed during cleanup")
+        row.connection_id = None
+        row.directory_id = None
+        row.directory_active = False
+        row.workos_cleanup_completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await db.execute(delete(EnterpriseSSOIdentity).where(EnterpriseSSOIdentity.org_id == org_id))
+        await db.execute(delete(EnterpriseDirectoryUser).where(EnterpriseDirectoryUser.org_id == org_id))
+        enterprise_sso._audit(db, org_id, "sso.workos_cleanup_completed")
+        db.add(row)
+        await db.commit()
+    return {"org_id": org_id, "directories_deleted": len(directories) if organization else 0,
+            "connections_deleted": len(connections) if organization else 0}

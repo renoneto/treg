@@ -95,9 +95,8 @@ Discover what your team has shared: `treg tool ls` · check credential health: `
 /plugin install treg@treg
 ```
 
-Installs with no token and no configuration. The skill loads as `treg:treg` and, on its first run,
-walks your agent through the rest — the CLI, sign-in, then `treg mcp install` — so you end up with
-the command line **and** treg's tools. Other agents: `npx skills add superdesigndev/treg -s treg`
+Installs the treg skill and treg's tools with no token and no configuration. Run `/mcp`, pick
+treg and sign in; the tools appear after it. Other agents: `npx skills add superdesigndev/treg -s treg`
 (or see [Workflow skills](#workflow-skills) for the rest).
 See [docs/CLAUDE-PLUGIN.md](docs/CLAUDE-PLUGIN.md). MiniMax Code / MiniMax Agent users: the same
 skill ships via the MiniMax Plugin Marketplace ([docs/MINIMAX-PLUGIN.md](docs/MINIMAX-PLUGIN.md)).
@@ -115,8 +114,9 @@ Ready-made recipes your agent runs end to end, every call through treg:
 | [`make-ugc`](skills/make-ugc/SKILL.md) | Make AI UGC videos: trending hooks, a presenter, talking-head clips, captions ([treg.to/ugc](https://treg.to/ugc)) |
 | [`jev-memory`](skills/jev-memory/SKILL.md) | Give Claude Code a memory: a Claude Code mod where Jev judges each prompt after the turn and keeps your lasting preferences, installed ready-made or built from one prompt ([the mod](examples/claude-code-mods/jev-memory)) |
 
-`install.sh` installs all of them for you except `jev-memory`, which is opt-in. To add them to an existing agent instead
-([skills.sh](https://skills.sh) CLI):
+`install.sh` installs all of them for you except `jev-memory`, which is opt-in. In Claude Code each one is
+also its own plugin in treg's marketplace: `/plugin install recruit@treg`, or pick them from `/plugin`. To add
+them to an existing agent instead ([skills.sh](https://skills.sh) CLI):
 
 ```bash
 npx skills add superdesigndev/treg                        # every public skill
@@ -240,10 +240,9 @@ hold the key or log in:
 ```bash
 treg run stripe -- get /v1/balance
 treg run gh -- pr list
-treg run --server agentmail-cli inboxes list   # runs on the registry server: the key never reaches you
 ```
 
-`--local` (default) runs on your machine; `--server` runs on the registry and streams output back.
+`--local` (default) runs on your machine. Server-side CLI execution (`--server`) is disabled globally.
 For a whole session, `treg shell start` opens a subshell where every registered CLI injects
 automatically — just use `stripe`, `gh`, … normally; `exit` reverts. `treg runs` is the audit log.
 
@@ -300,6 +299,12 @@ treg org join <code> --email you@acme.com     # accept an invite (creates you if
 treg org ls | use <slug> | members            # switch orgs, see the roster
 treg org access <member> --tools a,b          # per-member tool access (admin+)
 ```
+
+Team owners can enable enterprise SSO from the dashboard's **Team → SSO** tab. WorkOS connects the
+company's identity provider; owners can invite their IT admin to finish setup. Employees can enter
+their work email in any sign-in dialog or use the team's direct sign-in link. treg keeps its team roles and API keys. The
+Directory Sync plan removes a deactivated employee's team access. See
+[enterprise SSO setup](docs/enterprise-sso.md).
 
 ## Going deeper
 
@@ -370,6 +375,10 @@ Environment variables (prefix `TREG_`, read from `.env`):
 | `TREG_SESSION_SECRET`                     | *(empty)*                       | signs the dashboard session cookie; falls back to `TREG_SECRET_KEY`. Set a real value in prod                                                                              |
 | `TREG_GITHUB_CLIENT_ID` / `_SECRET`       | *(empty)*                       | GitHub OAuth sign-in (callback `<public_url>/auth/github/callback`); empty hides the button                                                                                |
 | `TREG_GOOGLE_CLIENT_ID` / `_SECRET`       | *(empty)*                       | Google OAuth sign-in (redirect `<public_url>/auth/google/callback`); empty hides the button                                                                                |
+| `TREG_WORKOS_API_KEY` / `_CLIENT_ID` / `_WEBHOOK_SECRET` | *(empty)* | WorkOS enterprise SSO; configure callback and signed directory webhook as described in [enterprise SSO setup](docs/enterprise-sso.md) |
+| `TREG_ENTERPRISE_SSO_BUNDLE_ONLY` | `true` | Show only the SSO + Directory Sync plan by default; set to `false` to offer both monthly plans. |
+| `TREG_ENTERPRISE_SSO_BUNDLE_PRICE_ID` / `TREG_ENTERPRISE_SSO_ONLY_PRICE_ID` | *(empty)* | Reusable monthly Stripe Price IDs in the same account as `TREG_STRIPE_SECRET_KEY`; an unset or unusable Price hides its plan. Stripe's Price supplies the displayed amount and Checkout charge. |
+| `TREG_ENTERPRISE_SSO_BUNDLE_MIN_PRICE_USD` / `TREG_ENTERPRISE_SSO_ONLY_MIN_PRICE_USD` | `0` | Optional whole-dollar minimum for each monthly Stripe Price; lower prices are hidden and rejected at Checkout. |
 | `TREG_INSTAGRAM_CLIENT_ID` / `_SECRET`    | *(empty)*                       | Instagram App ID and secret for direct Instagram Login (redirect `<public_url>/oauth/callback`)                                                                           |
 | `TREG_META_CLIENT_ID` / `_SECRET`         | *(empty)*                       | Meta app credentials for Facebook Pages, Meta Ads, and optional Instagram `page-tools`                                                                                     |
 | `TREG_OAUTH_REVIEW_PENDING`               | `instagram-login,page-messages` | Comma-separated registry review keys whose capabilities must remain gated; hosted review state is maintained privately.                                                   |

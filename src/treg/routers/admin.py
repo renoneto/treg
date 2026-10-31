@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from .. import reconcile
-from ..application import evidence_retention
+from ..application import enterprise_sso, evidence_retention
 from ..config import get_settings
 from ..infra import kv
 from ..infra.db import get_admin_read_session, get_admin_session
@@ -298,6 +298,14 @@ def _error_reason(text: str | None) -> str | None:
             if isinstance(value, str) and value:
                 return value[:120]
     return body[:120] or None
+
+
+@app.get("/admin/shadow")
+async def admin_shadow(days: int = Query(1, ge=1, le=30), _: str = Depends(require_superadmin)) -> dict:
+    """The shadow provider report (application.shadow): per capability and served endpoint, how often
+    each side answered, how often they agree, the candidate's speed and cost. Counts only."""
+    from ..application import shadow
+    return {"enabled": shadow.spec() is not None, **await shadow.report(days=days)}
 
 
 @app.get("/admin/calls")
@@ -816,6 +824,7 @@ async def admin_delete_user(
     # The USER row is about to go, so member-scoped rules must go from EVERY org — `DenyRule.user_id`
     # is a foreign key, and a surviving row would dangle (a hard error on Postgres).
     await drop_member_deny_rules(db, user_id)
+    await enterprise_sso.erase_user_links(db, user_id)
     await db.delete(user)
     await db.commit()
     return {"deleted_user": user_id, "deleted_empty_orgs": emptied}

@@ -291,6 +291,97 @@ class Membership(SQLModel, table=True):
     created_at: NaiveUTC = Field(default_factory=_now)
 
 
+class EnterpriseSSO(SQLModel, table=True):
+    """One team's enterprise sign-in entitlement and its external organization."""
+
+    org_id: int = Field(primary_key=True, foreign_key="org.id")
+    plan: str = Field(default="sso")  # sso | sso_directory
+    subscription_status: str = Field(default="pending")
+    stripe_subscription_id: str | None = Field(default=None, index=True, unique=True)
+    stripe_event_created: int = Field(default=0)
+    checkout_token: str | None = Field(default=None)
+    checkout_pending_until: int = Field(default=0)
+    checkout_url: str | None = Field(default=None)
+    cancel_at_period_end: bool = Field(default=False)
+    workos_org_id: str | None = Field(default=None, index=True, unique=True)
+    connection_id: str | None = Field(default=None)
+    directory_id: str | None = Field(default=None)
+    directory_active: bool = Field(default=False)
+    directory_event_ms: int = Field(default=0, sa_type=BigInteger)
+    workos_cleanup_completed_at: NaiveUTC | None = Field(default=None)
+    # Switched on only after a successful test sign-in; then other login doors cannot enter this team.
+    enforced: bool = Field(default=False)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class EnterpriseSSOIdentity(SQLModel, table=True):
+    """Stable IdP subject for one human in one customer connection."""
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "profile_id", name="uq_enterprise_sso_profile"),
+        UniqueConstraint("org_id", "user_id", name="uq_enterprise_sso_user"),
+        UniqueConstraint("org_id", "idp_id", name="uq_enterprise_sso_idp"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    profile_id: str
+    idp_id: str
+    connection_id: str
+    directory_user_id: str | None = Field(default=None, index=True)
+    active: bool = Field(default=True)
+    manually_blocked: bool = Field(default=False)
+    membership_created_by_sso: bool = Field(default=False)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class EnterpriseSSOBlock(SQLModel, table=True):
+    """Minimal team access decision, independent of a replaceable WorkOS connection."""
+
+    __table_args__ = (UniqueConstraint("org_id", "user_id", name="uq_enterprise_sso_block_user"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    user_id: int = Field(foreign_key="user.id", ondelete="CASCADE", index=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class EnterpriseSSOEvent(SQLModel, table=True):
+    """Processed WorkOS event id; webhook redelivery must be harmless."""
+
+    id: str = Field(primary_key=True)
+    created_at: NaiveUTC = Field(default_factory=_now)
+
+
+class EnterpriseSSOAudit(SQLModel, table=True):
+    """Durable team access evidence without emails or IdP profile data."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    event: str
+    actor_user_id: int | None = None
+    subject_user_id: int | None = None
+    from_role: str | None = None
+    to_role: str | None = None
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+
+
+class EnterpriseDirectoryUser(SQLModel, table=True):
+    """Directory roster and deactivation state, including people who have never signed in."""
+
+    __table_args__ = (UniqueConstraint("org_id", "directory_user_id", name="uq_enterprise_directory_user"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    org_id: int = Field(foreign_key="org.id", index=True)
+    directory_user_id: str
+    directory_id: str
+    idp_id: str
+    email: str
+    active: bool = Field(default=True)
+    last_event_ms: int = Field(default=0, sa_type=BigInteger)
+
+
 class ApiKey(SQLModel, table=True):
     """One credential control record for a human or scoped-agent membership.
 
@@ -324,6 +415,8 @@ class ApiKey(SQLModel, table=True):
     name: str
     safe_prefix: str | None = Field(default=None)
     key_hash: str | None = Field(default=None, index=True, unique=True)
+    # Corporate SSO proof at issuance for long-lived team credentials.
+    sso_org_id: int | None = Field(default=None)
     state: str = Field(default="active", index=True)  # active | disabled | revoked
     # Signed Default keys carry this per-team generation. Rotating increments it so only that
     # membership's previously issued Default token stops working; no replacement row is needed.
@@ -423,7 +516,7 @@ class CallRecord(SQLModel, table=True):
                             sqlite_where=text("api_key_id IS NOT NULL")),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int | None = Field(default=None, foreign_key="org.id", index=True)
+    org_id: int | None = Field(default=None, foreign_key="org.id")
     user_email: str = Field(index=True)
     tool_name: str = Field(index=True)
     method: str
@@ -882,10 +975,20 @@ class LedgerEntry(SQLModel, table=True):
     # `(org_id, created_at)` serves "this org, since midnight" (`money.spent_today_from_ledger`)
     # and `entries_of` (`/billing`). With only single-column indexes the planner walks the whole
     # platform's day and filters the org in memory. Revision 0021 builds it concurrently.
-    __table_args__ = (Index("ix_ledgerentry_org_id_created_at", "org_id", "created_at"),)
+    # The partial settle index carries `amount_micro` so `money.spend_since` sums a window from the
+    # index alone instead of fetching every row's heap page (revision 0089). The partial topup index
+    # finds a team's few top-ups without walking all of its rows (revision 0090).
+    __table_args__ = (Index("ix_ledgerentry_org_id_created_at", "org_id", "created_at"),
+                      Index("ix_ledgerentry_settle_org_id_created_at", "org_id", "created_at",
+                            postgresql_include=["amount_micro"],
+                            postgresql_where=text("kind = 'settle'"),
+                            sqlite_where=text("kind = 'settle'")),
+                      Index("ix_ledgerentry_topup_org_id_created_at", "org_id", "created_at",
+                            postgresql_where=text("kind = 'topup'"),
+                            sqlite_where=text("kind = 'topup'")))
 
     id: str = Field(primary_key=True)  # uuid4 hex
-    org_id: int = Field(foreign_key="org.id", index=True)
+    org_id: int = Field(foreign_key="org.id")
     block_id: str | None = Field(default=None, index=True)
     # grant | topup | reserve | settle | release
     kind: str = Field(index=True)
@@ -1030,7 +1133,7 @@ class TagSpend(SQLModel, table=True):
     __table_args__ = (Index("ix_tagspend_org_dim_val_created", "org_id", "dim", "val", "created_at"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int = Field(foreign_key="org.id", index=True)
+    org_id: int = Field(foreign_key="org.id")
     dim: str  # the tag key, e.g. "customer"
     val: str  # the tag value, e.g. "cust_8123"
     # The hold this belongs to (== call_id). Kept after settle so a row can be traced back to its call.
@@ -1235,6 +1338,7 @@ class OAuthCode(SQLModel, table=True):
     client_id: str = Field(index=True)
     user_id: int = Field(foreign_key="user.id", index=True)
     org_id: int = Field(foreign_key="org.id", index=True)
+    sso_org_id: int | None = Field(default=None)
     redirect_uri: str
     code_challenge: str = Field(default="")
     resource: str = Field(default="")
@@ -1257,6 +1361,7 @@ class OAuthGrant(SQLModel, table=True):
 
     family_id: str = Field(primary_key=True)
     current_org_id: int = Field(foreign_key="org.id", index=True)
+    sso_org_id: int | None = Field(default=None)
     granted_at: NaiveUTC = Field(default_factory=_now)
 
 
@@ -1540,8 +1645,9 @@ class CallReview(SQLModel, table=True):
 
 class Media(SQLModel, table=True):
     """A reference file a member hosted for a vendor to fetch (`treg host`): the image, voice clip
-    or video an AIGC endpoint takes as a public URL. Bytes live in the row, expire by TTL, and are
-    served by an opaque token that names no org or file. See docs/context/architecture/media.md.
+    or video an AIGC endpoint takes as a public URL. The bytes live in the object store under
+    `object_key`, or in `body` when the registry keeps them in the database; they expire by TTL and
+    are served by an opaque token that names no org or file. See docs/context/architecture/media.md.
     """
 
     __table_args__ = (Index("ix_media_org_created", "org_id", "created_at"),)
@@ -1550,7 +1656,8 @@ class Media(SQLModel, table=True):
     org_id: int = Field(foreign_key="org.id")
     content_type: str
     size: int = Field(default=0)
-    body: bytes
+    body: bytes | None = Field(default=None)
+    object_key: str | None = Field(default=None)
     created_at: NaiveUTC = Field(default_factory=_now)
     expires_at: NaiveUTC = Field(index=True)
 
@@ -1863,7 +1970,7 @@ class ArchiveSnapshot(SQLModel, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
-    key_id: int = Field(foreign_key="archivekey.id", index=True)
+    key_id: int = Field(foreign_key="archivekey.id")
     version: int = Field(default=1)                # 1..N within the key, newest = max
     status_code: int = Field(default=200)
     media_type: str = Field(default="")
@@ -1902,7 +2009,7 @@ class ArchiveKeyOrg(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("org_id", "key_hash", name="uq_archive_key_org"),)
 
     id: int | None = Field(default=None, primary_key=True)
-    org_id: int = Field(index=True)
+    org_id: int
     key_hash: str = Field(index=True)
     first_call_at: NaiveUTC = Field(default_factory=_now)
     last_call_at: NaiveUTC = Field(default_factory=_now)
@@ -2022,8 +2129,8 @@ class ArenaEvaluation(SQLModel, table=True):
 
 
 class ArchiveEndpointStat(SQLModel, table=True):
-    """The archive report's running totals, one row per endpoint — maintained by the recorder in
-    the SAME transaction as each snapshot, so the panel reads 50 tiny rows instead of walking
+    """The archive report's running totals, one row per endpoint — maintained by the recorder
+    through batched per-endpoint deltas (archive.flush_stats), so the panel reads 50 tiny rows instead of walking
     434k keys + 505k snapshots (measured 9.9s + 8.0s + 14.8s per report on prod, 2026-09-03).
     Counters move only via atomic column arithmetic (col = col + n): the credit-block drift
     taught us what read-modify-write does under parallel settles."""
@@ -2106,6 +2213,20 @@ class EndpointDayStat(SQLModel, table=True):
         default=False, sa_column=Column(Boolean, nullable=False, server_default=text("false")))
 
 
+class RankingsSnapshot(SQLModel, table=True):
+    """The public /rankings boards, built from `EndpointDayStat` by `application.rankings.refresh`
+    (the `treg-worker rankings refresh` cron), which is this table's only writer. One row
+    (`id = "current"`), replaced whole on each run; the page and `/rankings/data/*` read only it, so
+    no web process adds up the day buckets. It holds counts, rates and durations per tool and
+    endpoint, never a team, a key or money.
+    """
+
+    id: str = Field(primary_key=True)
+    through: str = Field(default="")   # YYYY-MM-DD, the newest complete UTC day the boards cover
+    body: dict = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
+    built_at: NaiveUTC = Field(default_factory=_now)
+
+
 class EndpointStatDirty(SQLModel, table=True):
     """An audit-corrected endpoint/day whose reliability bucket needs a recount.
 
@@ -2184,6 +2305,45 @@ class ApiKeySpendCursor(SQLModel, table=True):
     recount_after_org: int = Field(default=0)
     recount_owner: str | None = Field(default=None)
     recount_lease_until: NaiveUTC | None = Field(default=None)
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CallUsageDay(SQLModel, table=True):
+    """How many audit rows one team wrote for one member, kind, tool and client on one UTC day, and
+    when the last of them was: the read model behind the Usage page's counts and the observed-agents
+    roster. Folded from `callrecord` by `application.call_usage_rollup` (the `treg-worker usage
+    rollup` cron), which is this table's only writer; team deletion clears it with the team. The
+    reports read a few hundred of these rows instead of every audit row of the window.
+
+    `kind` is the audit row's own value; readers map an unexpected one to "call", as they always
+    did. Counts inherit the audit table's loss: a row `audit.py` shed is not counted here either.
+    """
+
+    org_id: int = Field(foreign_key="org.id", primary_key=True)
+    day: str = Field(primary_key=True)  # YYYY-MM-DD, UTC, from CallRecord.created_at
+    user_email: str = Field(primary_key=True)
+    kind: str = Field(primary_key=True)
+    tool_name: str = Field(primary_key=True)
+    client: str = Field(primary_key=True)
+    calls: int = Field(default=0)
+    last_at: NaiveUTC
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class CallUsageCursor(SQLModel, table=True):
+    """Where `application.call_usage_rollup` has got to in `callrecord`. One row
+    (`id = "callrecord"`). `cursor_id` is the last folded `CallRecord.id`; reports add the rows
+    after it live. `history_from` is the first UTC day the rollup holds; nothing reads before it.
+    `caught_up_at` is NULL until a run drains the first backfill, and the reports say usage is
+    being prepared until then. With no row at all (the worker never ran) the reports aggregate
+    `callrecord` directly, as a small self-hosted registry without the cron always has.
+    """
+
+    id: str = Field(primary_key=True)
+    cursor_id: int = Field(default=0)
+    watermark: NaiveUTC | None = Field(default=None)  # created_at of the last folded row
+    history_from: str  # YYYY-MM-DD
+    caught_up_at: NaiveUTC | None = Field(default=None)
     updated_at: NaiveUTC = Field(default_factory=_now)
 
 
@@ -2380,3 +2540,37 @@ class TableDoc(SQLModel, table=True):
     created_by: str
     created_at: NaiveUTC = Field(default_factory=_now)
     updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class ShadowCursor(SQLModel, table=True):
+    """Where `application.shadow` has got to in `callrecord`. One row (`id = "callrecord"`); the
+    first run starts at the newest call, so the shadow never reads history."""
+
+    id: str = Field(primary_key=True)
+    cursor_id: int = Field(default=0)             # last consumed CallRecord.id
+    updated_at: NaiveUTC = Field(default_factory=_now)
+
+
+class ShadowPair(SQLModel, table=True):
+    """One served call paired with the shadow provider's answer to the same question
+    (`application.shadow`, its only writer). Holds no names, emails or phone numbers: the subject is
+    a salted hash and each compared field is a yes/no. Rows past `shadow_retention_days` are deleted
+    by the same job; the shadow run ends by dropping the table's rows."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: NaiveUTC = Field(default_factory=_now, index=True)
+    call_id: int = Field(default=0)
+    capability: str = Field(index=True)
+    endpoint_id: str = Field(default="")          # the served provider's endpoint
+    subject: str = Field(default="")              # salted hash of the normalized identity
+    served_found: bool = Field(default=False)
+    shadow_found: bool = Field(default=False)
+    served_count: int | None = Field(default=None)
+    shadow_count: int | None = Field(default=None)
+    served_with_email: int | None = Field(default=None)
+    shadow_with_email: int | None = Field(default=None)
+    fields: dict = Field(default_factory=dict, sa_column=Column(JSON))  # {field: agreed}
+    shadow_status: int = Field(default=0)         # 0 = no answer (timeout or transport error)
+    shadow_ms: int | None = Field(default=None)
+    shadow_units: float | None = Field(default=None)
+    served_cost_micro: int = Field(default=0)

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import json
 
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
 from sqlmodel import select
 
 from treg import api as A
@@ -108,6 +108,22 @@ async def test_discovery_refused_for_a_provider_that_cannot_discover(clients: As
     st = await _connect_byo(clients)  # BYO → no provider → no discovery
     r = await clients.get(f"/connections/{st['secret_id']}/resources")
     assert r.status_code == 422
+
+
+async def test_youtube_quota_discovery_returns_a_safe_error(clients: AsyncClient, treg_google_app, monkeypatch):
+    st = await _connect_byo(clients, provider="youtube", name="youtube")
+    async def quota_response(*args, **kwargs):
+        return Response(403, json={"error": {
+            "code": 403,
+            "message": "The request cannot be completed because you have exceeded your quota.",
+            "errors": [{"reason": "quotaExceeded", "domain": "youtube.quota"}],
+        }})
+
+    monkeypatch.setattr(A.app.state.http, "get", quota_response)
+    r = await clients.get(f"/connections/{st['secret_id']}/resources")
+    assert r.status_code == 502
+    assert r.json() == {"detail": {"code": "youtube_quota_exceeded"}}
+    assert "exceeded your quota" not in r.text
 
 
 async def test_revoke_removes_the_connection(clients: AsyncClient):
@@ -218,6 +234,26 @@ def _meta_test_provider(monkeypatch, service: str, **over):
         provider = dataclasses.replace(provider, authorization_methods=methods)
     monkeypatch.setitem(P.REGISTRY, service, dataclasses.replace(
         provider, discover_base_url="http://upstream", **over))
+
+
+def test_appsecret_proof_only_pairs_treg_meta_tokens_with_meta_hosts(treg_meta_app):
+    """treg's Meta app requires App Secret Proof. The proof is HMAC(app secret, token) and is owed
+    only for a token treg's own app issued, sent to Meta's own host; a team's own app or any other
+    destination never gets anything computed with treg's secret."""
+    import hashlib
+    import hmac
+
+    from treg import oauth_providers as P
+
+    fb, graph = P.REGISTRY["facebook"], "https://graph.facebook.com/v25.0/me/accounts"
+    want = hmac.new(b"treg-meta-csec", b"TOKEN", hashlib.sha256).hexdigest()
+    assert P.appsecret_proof(fb, "treg-meta-cid", "TOKEN", graph) == want
+    assert P.appsecret_proof(P.REGISTRY["meta-ads"], "treg-meta-cid", "TOKEN", graph) == want
+    page_tools = P.REGISTRY["instagram"].profile_for_authorization("facebook-page")
+    assert P.appsecret_proof(page_tools, "treg-meta-cid", "TOKEN", graph) == want
+    assert P.appsecret_proof(fb, "team-own-cid", "TOKEN", graph) is None
+    assert P.appsecret_proof(fb, "treg-meta-cid", "TOKEN", "https://collector.example/x") is None
+    assert P.appsecret_proof(P.REGISTRY["linkedin"], "treg-meta-cid", "TOKEN", graph) is None
 
 
 async def test_business_owned_pages_join_the_facebook_picker(clients: AsyncClient, treg_meta_app, monkeypatch):

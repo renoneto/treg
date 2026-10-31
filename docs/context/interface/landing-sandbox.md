@@ -1,16 +1,16 @@
 ---
-title: Landing sandbox backend - front-end entry removed
-status: shipped
+title: Landing sandbox backend - closed
+status: closed
 sources:
   - src/treg/sandbox.py
   - src/treg/sandbox_identity.py
-  - src/treg/application/onboard/pubfeed.py
   - src/treg/application/onboard/sandbox.py
   - src/treg/application/onboard/__init__.py
   - src/treg/domain/governance/sandbox.py
   - src/treg/api.py
   - src/treg/routers/onboard.py
   - src/treg/routers/web.py
+  - src/treg/domain/identity/access.py
   - frontend/src/state/boot.js
   - frontend/src/components/SignedOutPage.vue
   - src/treg/web/install.sh
@@ -30,8 +30,18 @@ related:
 > key-leak explanation and footer CTA it used to render were dropped from this component along with
 > the sandbox studio; that marketing content now lives on the public landing page (`/`) instead.
 
-The sections below document backend behavior that is still shipped but has no visitor-facing mint
-path in the Dashboard components. Provisioning, export, samples, and garbage collection remain in
+> **Closed.** `POST /demo/sandbox` returns 410 and mints nothing. Authentication refuses every
+> `@sandbox.treg.local` visitor with 403 ("the demo sandbox is closed"), centrally in
+> `domain/identity/access.py`: `_membership_by_token` checks the token's user, and
+> `_user_from_identity_token` / `_user_from_session` check theirs, so `require_member`,
+> `require_identity` and every direct resolver inherit it. The sandbox was an anonymous identity on
+> production guarded by per-route exceptions; one missed route (`POST /onboard/demo`) let a visitor
+> mint a real team. Since nothing mints, `gc` (which only ran from the mint) no longer runs on its
+> own; leftover sandbox orgs are cleaned up deliberately. The code below stays until a separate
+> removal change deletes it.
+
+The sections below document backend behavior that is still in the tree but unreachable: no mint path
+and no accepted visitor token. Provisioning, export, and garbage collection remain in
 `application/onboard/sandbox.py`; the call-side sandbox engine remains in `sandbox.py`; and the routes
 remain in `routers/onboard.py`. Their removal is intentionally deferred to the backend follow-up.
 
@@ -54,8 +64,11 @@ onboarding demo teams (also `demo`, but team-named).
 
 `is_sandbox_user(user)` is the companion check on the **visitor** (email ends in `@sandbox.treg.local`,
 `SANDBOX_DOMAIN`). Such a login-free visitor may act ONLY inside its own sandbox org — it can **never
-create a real team** (`POST /orgs` → `create_org` returns 403: "sign in with GitHub, Google, or email")
-nor otherwise graduate to a real account. Escaping the sandbox requires a real sign-in door.
+create a real team** (`POST /orgs` → `create_org` and `POST /onboard/demo` → `provision_demo` both
+return 403: "sign in with GitHub, Google, or email") nor otherwise graduate to a real account. The
+demo seeder needs its own check: the visitor is a `member` of its sbx-* team, not an owner, so
+`existing_demo_org` misses it and the seeder would mint a second team whose slug `is_sandbox` never
+matches. Escaping the sandbox requires a real sign-in door.
 
 ## Safety: sandbox calls never touch the network (except the one live wire)
 `application.call.service` checks `demo_sandbox.is_sandbox(caller.org)` and, for a sandbox, short-circuits to
@@ -85,32 +98,11 @@ fully editable). `is_live_tool` lives in `sandbox.py`; `visitor_name` and its wo
 Both routes remain pending backend removal, but the Dashboard components no longer calls either one or holds a
 sandbox token.
 
-## The public payments feed (`application/onboard/pubfeed.py`)
-The feed is the landing page's **live payments ticker**: a stranger's live-wire charge appears on the
-page within seconds, no refresh, as skeptic-proof that the proxy really injected a real key. The path:
-visitor `curl` → live wire relays a Stripe test charge → Stripe fires `charge.succeeded` at
-`POST /stripe/webhook` (`stripe_webhook`) → `pubfeed.push_charge(...)` → `GET /landing/stripe-feed`
-(`landing_stripe_feed`) streams it over Server-Sent Events via `pubfeed.stream()`. The webhook verifies the
-`Stripe-Signature` with `pubfeed.verify_signature` (constant-time HMAC-SHA256 over `{t}.{body}`, timestamps
-older than `SIG_TOLERANCE_S` rejected as replays, any of several `v1` signatures accepted during rotation);
-it returns **404 when `TREG_DEMO_STRIPE_WEBHOOK_SECRET` (`settings.demo_stripe_webhook_secret`) is unset**, so
-a deploy without the secret exposes no unauthenticated POST surface. Design points:
-- **In-memory + tiny.** A `deque(maxlen=FEED_MAX)` ring buffer plus a set of per-subscriber `asyncio.Queue`s;
-  it is a marketing surface, not a system of record. A dropped event on restart costs nothing (Stripe retries),
-  and each instance of a multi-instance deploy streams only the deliveries its own webhook received.
-- **No visitor-controlled text can reach the page.** `push_charge` copies **only server-chosen fields**
-  (amount/currency/created, a 6-char `id_suffix`, and a `receipt_url` only if it starts with
-  `https://pay.stripe.com/`) — never `description`. The display **name** (`_display_name`) is accepted only when
-  it passes `_is_wordlist_name` (adjective-animal-nnn, both words from the exact `ADJECTIVES`/`ANIMALS` lists,
-  number ≤ 999); anything else falls back to `_derived_name`, a deterministic wordlist name hashed from the
-  charge id. This is the "graffiti lesson": hand-typed strings can never deface the shared feed.
-- **`stream()`** replays the ring buffer to a fresh subscriber, then live events, with a `: ping` keepalive every
-  `KEEPALIVE_S`; a subscriber that lags past `_MAX_SUBSCRIBER_LAG` is dropped rather than buffered forever. The
-  SSE response sets `X-Accel-Buffering: no` so a reverse proxy does not buffer it. `reset()` is a test hook.
-
 Bounds: `MAX_TOOLS`/`MAX_SECRETS` (3) are enforced by `domain/governance/sandbox.py` on
 `POST /tools|/secrets`; `SANDBOX_TTL_MIN` (60) + `gc(db)` reaps expired visitors (their org + all
-org-scoped rows), run opportunistically on each mint. The reaper deletes the org through the ONE shared
+org-scoped rows), run opportunistically on each mint. It deletes only orgs `is_sandbox` matches: a
+visitor that also belongs to any other org is kept whole (user and every org) and logged for review,
+since that membership should not exist and deleting it would erase the only record of it. The reaper deletes the org through the ONE shared
 `cascade_delete_org` (`domain/governance/teams.py`) - it must never keep its own list of org-scoped
 tables. It once did, the copy never learned about `IdempotentCall`, and on 2026-09-02 Postgres refused
 the membership delete on every mint. `mint_sandbox` now also isolates the reaper: a gc failure is
@@ -123,20 +115,6 @@ the `MAX_TOOLS`/`MAX_SECRETS` cap.
 
 `export_skill(db, org)` → `GET /demo/sandbox/skill` turns whatever the visitor built into a shareable
 skill manifest (treg.json + SKILL.md, secret values redacted to placeholders).
-
-## Hosted sample skills + the "Run in Claude Code" flow
-`SAMPLE_SKILLS` (`posthog-insights`, `stripe-billing`) each mirror a seeded tool so an installed skill's
-proxied calls resolve against the visitor's sandbox. `skill_files(name, base, token)` builds the three
-files a skill folder is — `SKILL.md` (agent recipe: call the treg proxy, key injected server-side),
-`treg.json` (wiring: base_url + which secret by name), `.secret` (empty; value stays in the vault).
-- `GET /skills/samples` (`skill_samples`) — public JSON of each sample + its files (for the landing).
-- `GET /skills/{name}/install.sh?token=` (`skill_install`) — `install_script(name, base, token)` emits a
-  POSIX `sh` that `mkdir -p ./.claude/skills/<name>` and writes the files (token baked in via quoted
-  heredocs), so `curl … | sh` from a project dir installs the skill for Claude Code to load. Its recipe
-  calls `{BASE}/call/…` with the caller's treg token — the API key never lands on the machine. The
-  `token` query param is **charset-restricted** (`re.fullmatch(r"[A-Za-z0-9_\-]{1,200}")`, else 422)
-  because it is interpolated into that shell script — a crafted value can't inject a newline + extra
-  commands into the generated `curl … | sh`.
 
 ## CLI installer
 `GET /install.sh` (`install_sh`) serves `src/treg/web/install.sh`, `{BASE}`-templated like `llms.txt`

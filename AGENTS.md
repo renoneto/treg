@@ -34,16 +34,25 @@ from the repository that owns the task; the sibling path supplies the other half
 Everything else in this file is guidance; these are the contract, and they win over any other passage.
 
 1. A team's own key always wins over treg's, is never metered, and is never routed or overflowed.
+   An operator's exact org/endpoint protective call allowance applies to every credential tier;
+   it counts admitted logical calls, not money or provider credits.
+   This temporary allowance permits calls when Redis state cannot be confirmed; it is not a durable cap.
 2. A hold (the balance `reserve` sets aside for one call) is settled or released exactly once, on
    every path: timeout, cancellation and exceptions included.
 3. A request holds zero database connections while upstream or object-storage I/O is in flight.
    Keep `reserve` and `settle` separate; read archive pointers, close the session, then fetch bytes.
 4. Plain `/call/` is a faithful relay: the injected credential (on treg's shared key, one of treg's
-   accounts for the provider, chosen per call and fixed for anything an account created), the
-   transport headers listed in
+   accounts for the provider, chosen per call and fixed for anything an account created; on a
+   connection to treg's own Meta app it also carries `appsecret_proof`, the HMAC of the injected
+   token with the app secret, replacing any caller value), the transport headers listed in
    `src/treg/infra/upstream/relay.py`, and (on treg's shared key only) the per-org and, for pinned
    agents, per-pin re-scoping of the caller's `Idempotency-Key` and treg's own `User-Agent` in place
-   of the caller's are the only rewrites. A credential
+   of the caller's are the only rewrites of what the caller sent. One addition is allowed: when the
+   catalog declares `ceiling_param` (`{in: query, name, unit: usd}` on the provider file or on that
+   endpoint's `cost`), the call carries a caller ceiling, and the caller did not already send that
+   query name, the call application appends `name=<remaining ceiling in USD>` to the outbound query
+   before `relay()`. An explicit caller value is never rewritten. The appended pair is absent from
+   the inbound query, so it does not enter `params_hash` or the archive key. A credential
    binding with `location: "json"` explicitly parses and reserializes the top-level JSON object; it
    is not byte-faithful and must never be used with an upstream that signs or hashes the raw body.
    Never add upstream-specific modeling.
@@ -55,7 +64,12 @@ Everything else in this file is guidance; these are the contract, and they win o
    omits credential injection but does not strip or rewrite caller headers.
    Routed endpoints and overflow wrap the child's answer and say so; they never alter it. With
    `X-Treg-Route-Verify`, an email or phone find makes one more linked child call (the check), with its own
-   hold and charge, and reports it in `_treg.verification`; the find's answer is not altered. Responses needing settlement or ownership evidence are buffered by the application
+   hold and charge, and reports it in `_treg.verification`; the find's answer is not altered. With
+   `X-Treg-Route-Confirm`, an email find keeps asking providers after a hit until another returns the
+   same address, each attempt billed as usual, and reports it in `_treg.confirmation`; the answer
+   returned is the first provider's, unaltered. With `X-Treg-Route-Decisive`, an email check keeps
+   asking providers until one answers valid or invalid, each attempt billed as usual, and reports it
+   in `_treg.decision`; the answer returned is the deciding provider's, unaltered. Responses needing settlement or ownership evidence are buffered by the application
    up to 8 MiB; exceeding that limit fails without charging, never returns a successful prefix.
    An endpoint declaring `spooled_response` (inline media) instead reads its metered 2xx to an
    unlinked temp file under a per-body cap and per-process budget, settles from only the paths its
@@ -136,7 +150,8 @@ agents then built against a constitution that was wrong.
   credentials, catalog prices and balances, and writes only what `tests/test_call_architecture.py`
   allowlists (the ledger entries, idempotency claims, OAuth refresh, audit and telemetry, first-call
   markers, tag budgets, capacity marks, overflow spend, the member's daily-cap slot, the per-team
-  archive-question marks, and durable provider-resource ownership). Extend the
+  archive-question marks, durable provider-resource ownership, and Redis org/endpoint
+  quota admission counters). Extend the
   test's allowlist in the same PR as any new write, and expect the reviewer to ask why.
 - **The tool hub** (`application/hub/`, behind `TREG_HUB_ENABLED`) runs a maker's recipe as ordinary
   calls: every step goes through `execute_call` under its own hold, a catalog step as the caller and
@@ -171,8 +186,10 @@ agents then built against a constitution that was wrong.
 ### Security guards that look redundant on purpose
 
 `expose_dev_code` (dev OTP only on a local sqlite database, `config.py`), the call-time SSRF check
-(`infra/upstream/ssrf.py`), the fail-loud missing-Fernet-key check in `verify_db`, and the
-`treg run` allow-list and rlimits (`runner.py`). Read the fragment before touching any of them.
+(`infra/upstream/ssrf.py`), the fail-loud missing-Fernet-key check in `verify_db`, and
+the unconditional `POST /run` denial (`api.py`). Server-side CLI execution is disabled for every
+caller; an executable allow-list and rlimits are not an isolation boundary. Read the fragment before
+touching any of them.
 
 ## Development
 
@@ -209,7 +226,7 @@ so parallel runs and side-by-side runs never share one.
 
 ## Working agreement
 
-- Keep the suite green; add tests for new behavior. Conventional Commits (`feat(scope): ...`,
+- Keep the suite green. Conventional Commits (`feat(scope): ...`,
   `fix: ...`, `docs: ...`); one logical change per commit; the PR says what changed and why and
   names the fragments it updated.
 - **Comments only for external constraints and public contracts**: behavior a vendor, platform
@@ -229,7 +246,7 @@ so parallel runs and side-by-side runs never share one.
   per-provider sections in `docs/context/architecture/catalog.md`: a provider's quirk lives on
   its row as a `note`. No per-endpoint tests: the round-trip test over every shipped adapter and
   the validator already judge the rows, and a test that restates a list of declarations is
-  deleted, not extended. Code that a data PR needs is its own PR, merged first.
+  deleted, not extended. Code a data change needs ships in the same PR as its first rows.
 
 ## When writing user-facing copy
 

@@ -41,7 +41,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
-from ... import crypto, jsontext
+from ... import crypto, jsontext, oauth_providers
 from ...application.call.types import GatewayFailed, UpstreamRequest, UpstreamResponse
 from ...config import TREG_USER_AGENT, get_settings
 from ...models import Secret, Tool
@@ -143,6 +143,7 @@ async def relay(
     client: httpx.AsyncClient,
     drop_params: set[str] | None = None,
     force_identity: bool = False,
+    before_outbound: Callable[[], Awaitable[None]] | None = None,
 ) -> UpstreamResponse:
     # Headers: preserve everything (incl. duplicates / cookies) except hop-by-hop + our token.
     # `.raw` is the original (bytes, bytes) pairs; httpx.Headers is a multidict, so binding
@@ -165,7 +166,9 @@ async def relay(
         headers["accept-encoding"] = "identity"
     # Query: a list of pairs preserves duplicate keys verbatim (?tag=a&tag=b). A marketplace
     # endpoint-id call may have CONSUMED some params into the path (`{siteUrl}` placeholders) —
-    # those must not also reach the upstream as query noise.
+    # those must not also reach the upstream as query noise. The call application may already
+    # have appended a catalog ceiling_param the caller did not send; it is forwarded like any
+    # other query param.
     params: list[tuple[str, str]] = [
         (k, v) for k, v in request.query_items
         if not drop_params or k not in drop_params
@@ -211,13 +214,17 @@ async def relay(
                     detail=f"credential injection failed: {exc}") from exc
             continue
         secret = secrets[binding["secret_id"]]
+        raw = crypto.decrypt(secret.value)
         try:
-            injectors.inject(headers, params, binding, crypto.decrypt(secret.value),
-                             json_body=json_body)
+            injectors.inject(headers, params, binding, raw, json_body=json_body)
         except ValueError as exc:
             raise GatewayFailed(
                 "injection_failed", status_code=502,
                 detail=f"credential injection failed: {exc}") from exc
+        # Part of the injected credential on treg's Meta app: the HMAC pairing its token with the app.
+        if proof := oauth_providers.connection_appsecret_proof(secret, binding, raw, upstream_url):
+            params[:] = [(k, v) for (k, v) in params if k != "appsecret_proof"]
+            params.append(("appsecret_proof", proof))
 
     # Only carry a body when the caller actually sent one — otherwise passing an (unsized) stream
     # makes httpx frame the request `Transfer-Encoding: chunked`, putting a bogus body-frame on a
@@ -248,6 +255,8 @@ async def relay(
         raise GatewayFailed(
             "ssrf_refused", status_code=502,
             detail="upstream host resolves to a non-public address")
+    if before_outbound is not None:
+        await before_outbound()
     upstream_resp = await client.send(upstream_req, stream=True)
 
     # Response drop set: hop-by-hop + whatever the upstream marked hop-by-hop via its Connection

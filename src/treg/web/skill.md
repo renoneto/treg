@@ -19,19 +19,35 @@ hold it:
 
 ## First: check where you stand
 
-Run `treg`. It prints the account, the active team and your role, the balance, the team's own tools
-and the next commands to run; a blocker (not signed in, no team, an empty balance) comes first in
-its `help` lines. Not set up yet:
+How treg reached you decides the first step. Take the first case that holds; either the MCP tools
+or the CLI is enough, and having both is fine.
 
-```bash
-curl -fsSL {BASE}/install.sh | sh
-treg login                            # browser sign-in: GitHub, Google or an emailed code
-treg login --email you@company.com    # an emailed 6-digit code
-treg login --token <team-token>       # non-interactive, for agents and CI
-```
+1. **You can see treg's MCP tools** (`catalog_search`, `catalog_get`, `call`, `balance`,
+   `my_tools`): treg is connected. Use them and install nothing; every `treg` command on this page
+   maps onto a tool (see "Over MCP" below). A tool that answers "not authenticated" means the human
+   signs in through the app's MCP or connector settings (in Claude Code: `/mcp`, pick treg,
+   Authenticate).
+2. **`treg` runs in your terminal**: run `treg`. It prints the account, the active team and your
+   role, the balance, the team's own tools and the next commands to run; a blocker (not signed in,
+   no team, an empty balance) comes first in its `help` lines. Not signed in:
 
-The installer puts in the CLI and this skill for every agent it detects; `treg mcp install` adds
-treg's MCP server to them once you are signed in. Given a token, the installer does both.
+   ```bash
+   treg login                            # browser sign-in: GitHub, Google or an emailed code
+   treg login --email you@company.com    # an emailed 6-digit code
+   treg login --token <team-token>       # non-interactive, for agents and CI
+   ```
+
+3. **Neither**: treg is not set up here. Run the installer only when the human asked you to set treg
+   up; otherwise give them these two ways and wait:
+
+   ```bash
+   curl -fsSL {BASE}/install.sh | sh    # the CLI, plus this skill for every agent it detects
+   treg login
+   ```
+
+   or, in an app that takes MCP servers, add `{BASE}/mcp/` and sign in when it asks. Given a team
+   token, `curl -fsSL {BASE}/install.sh | sh -s -- --token <token>` does the install and sign-in at
+   once.
 
 Everything runs in the **active team**. Invites arrive by email: `treg invites` lists them,
 `treg accept` takes one (or `treg org join <code>`); `treg org use <slug>` switches teams. A new
@@ -58,6 +74,12 @@ treg catalog get scrapecreators.reddit.subreddit.posts   # parameters, price, a 
 treg call scrapecreators.reddit.subreddit.posts --query subreddit=news
 treg catalog request "<what you need>"                   # searched and it is not there: file it
 ```
+
+Bare `treg` and `treg catalog …` print TOON from CLI 0.28 on (earlier releases print tables):
+`key: value` lines, and tables as `name[N]{field,…}:` with one row per line. The `call` line and the
+`help[N]` commands print exactly as you type them; `param_examples` shows each parameter's own
+example, not a request to send; `--json` prints the server's JSON instead. `treg call` itself prints
+the provider's answer as it came; `treg --json call` wraps it (see "Scripting many calls" below).
 
 <!--hub-->
 **Six jobs are already built as tools. Call the tool, not the chain.** Each is one call on
@@ -98,20 +120,22 @@ How a routed call works:
 - A filter the serving provider could not apply is named in `X-Treg-Ignored-Filters` and
   `_treg.ignored_filters`: filter the rows yourself, or send `X-Treg-Route-Strict-Filters: 1` to be
   refused with an unbilled 422 instead.
+- When you sent a `domain` on an email find, `_treg.domain_match` (and `X-Treg-Domain-Match`) says
+  whether the hit's mailbox domain matches it. A LinkedIn-only provider often returns a former
+  employer; the hit is still billed — read the flag before treating the address as current.
 - An asynchronous provider is polled for up to 60 seconds. If it is still running you get HTTP 202
   with `_treg.outcome: pending`, its poll descriptor, `reserved_micro` and `charged_micro: null`. Do
   not retry or start another provider: the task may still finish and charge.
 - `catalog_get` on a routed id shows the ranked plan and its prices before you spend.
 
 **A found contact is not a confirmed one.** An email or phone find returns the provider's best
-match. Only `output.verified: true` means the mailbox was checked; otherwise `_treg.advice` names
-the verify step. Run it before anyone sends, and never re-send the same find: every hit is billed,
-repeats included.
+match; `_treg.advice` says when it still needs checking. Verify before anyone sends, and never
+re-send the same find: every hit is billed, repeats included.
 
 - Send `X-Treg-Route-Verify: true` on `treg.people.email.find`, `treg.people.email.find.personal` or
   `treg.people.phone.find` to check each hit in the same call, as its own small charge. Read
-  `_treg.verification.verdict` and follow `_treg.advice`. A live phone line does not prove the
-  number is this person's.
+  `_treg.verification.verdict` (it wins over the provider's own `output.verified`) and follow
+  `_treg.advice`. A live phone line does not prove the number is this person's.
 <!--hub-->
 - `treg-hub.verified-email` finds and verifies in one call, and bills its fee only for a usable
   email.
@@ -123,17 +147,20 @@ repeats included.
   a result.
 <!--/routed-->
 
-**Choosing between providers of one job.** `treg catalog get <id>` lists every provider of the same
-job with `COST`, `WORKS` (the success rate treg observed, with its sample size), `SPEED` (median)
-and `LAST OK`. Work down this order:
+**Choosing between providers of one job.** `treg catalog get <id>` compares the providers of the same
+job in `compare` (the ten most reliable and cheapest, with the job's routed `treg.<job>` id second;
+its `help` names the command that lists them all): `price`, `works`
+(the success rate treg observed) over `calls`, `hit` (how often it found something), `p50` (median
+speed), `last_ok_days` and `verified`. Work down this order:
 
 1. **The inputs you actually hold.** A tool that wants a `profile_url` is no substitute when you have
    a name and a domain, whatever it costs.
-2. **Reliability.** A high `WORKS` on a real sample beats a rounder number on a tiny one: `99% (121)`
-   is stronger evidence than `100% (8)`.
+2. **Reliability.** A high `works` on a real sample beats a rounder number on a tiny one: `99%` over
+   121 calls is stronger evidence than `100%` over 8.
 3. **Price.** Spreads inside one job reach 200×, so this is usually where the money is.
-4. **`LAST OK`** breaks ties. A bare age means a real call came back; a `✓` age is the catalog's own
-   verification stamp, not live traffic; `—` means nobody has verified or called it.
+4. **Recency** breaks ties. `last_ok_days` counts from the last real call that came back; `verified`
+   is the catalog's own hand-run stamp, not live traffic; neither means nobody has called or
+   verified it.
 
 After a 429, a 5xx or a timeout, switch to the next provider and say which. **Never retry a 4xx
 elsewhere:** it is almost always your request, and retrying spends money on several providers for
@@ -203,9 +230,13 @@ each call, not the loop.
   amount, not a charge: the task settles the real one when it succeeds and refunds it all when it
   fails, so report it as reserved until the task is done.
 - **A hard ceiling per call:** `X-Treg-Route-Max-Cost: <usd>` refuses a call whose reservation would
-  exceed it (402 `route_max_cost`, nothing charged). It applies to each request on its own and does
-  not add up across calls. Direct calls have no default; on a routed call it also
-  bounds the whole waterfall, $1 by default.
+  exceed it (402 `route_max_cost`, nothing charged). Where the catalog says the provider accepts a
+  ceiling parameter, treg also forwards the remaining ceiling upstream, so a provider that fails
+  over to a dearer source cannot settle above it; a refusal from that parameter is a non-2xx and
+  costs nothing. For every other provider the header stays a pre-reservation guard. It applies to
+  each request on its own and does not add up across calls. Direct calls have no default; on a
+  routed call it also bounds the whole waterfall, $1 by default, and each child receives the
+  unspent remainder.
 - **Failed calls are free.** A 4xx or 5xx relayed from the provider costs nothing. Empty results mean
   whatever the provider means by them; treg relays and does not normalise. A provider that reports
   a failure inside a 2xx (a DataForSEO task status other than 20000) is flagged with
@@ -260,6 +291,7 @@ first call's charge in `X-Treg-Original-Cost-Micro`.
 - Idempotency keys belong to the caller and last 24 hours; a call that fails frees its key at once.
 - 409: the original call is still running; retry shortly.
 - 410 (`idempotency_response_lost`, `idempotency_response_too_large` over the 2 MB replay limit,
+  `idempotency_response_not_retained` when provider terms forbid keeping the answer,
   `idempotency_outcome_unknown`): the first call was, or may have been, charged and its answer was
   not kept. The body names the `call_id`; `GET {BASE}/calls/<call id>` shows the cost and
   `/result` any stored answer. A new idempotency key calls again.
@@ -327,7 +359,7 @@ without you logging in:
   Python requests and httpx, and Deno are covered at any version.
 - `treg run stripe -- balance retrieve` runs one vendor CLI. `--local` (the default) runs it on this
   machine, isolated under a dedicated user once an admin has run `sudo treg setup-local-run`;
-  `--server` runs it on the registry so the key never reaches the machine.
+  server-side execution (`--server`) is disabled globally.
 - `treg shell start` opens a subshell where registered CLIs get their credentials by themselves;
   `--proxy` also credentials HTTPS calls your own code makes to a registered API. `treg serve` runs
   the same proxy as a background service. A certificate-pinned client refuses the interception: use

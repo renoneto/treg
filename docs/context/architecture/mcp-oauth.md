@@ -9,6 +9,7 @@ sources:
   - src/treg/domain/identity/session.py
   - src/treg/domain/identity/access.py
   - src/treg/domain/identity/api_keys.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
   - src/treg/routers/api_keys.py
   - src/treg/routers/auth.py
   - src/treg/web/claude-connector.html
@@ -27,6 +28,13 @@ related:
 The same authorization server also serves one non-MCP client, "treg for Sheets" (`treg-sheets`):
 its own resource (`<public_url>/table`) and scope, a grant that belongs to the person rather than one
 team, and a token accepted only on the table routes. See [table](table.md).
+
+When a team requires enterprise SSO, normal-login consent cannot create a grant for that team.
+SSO consent is scoped to its own team, including Sheets requests that select a team per call.
+`OAuthCode.sso_org_id` and `OAuthGrant.sso_org_id` retain that proof through code exchange and
+refresh; access tokens pass it through the internal identity bridge to `require_member`. A grant
+created before enforcement has no such proof and stops working on the enforced team at use and
+refresh. An SSO-scoped grant cannot be moved to another team.
 
 # MCP
 
@@ -149,7 +157,7 @@ same-named team tool. A change is incomplete if only one relevant MCP test file 
 | Tool | Job |
 |---|---|
 | `catalog_search` | find endpoints by what you want to DO, with prices; in the experiment's `v2` mode a verdict and the jobs on the page ([search-experiment](search-experiment.md)) |
-| `catalog_get` | one endpoint in full: params, cost, reliability, sibling providers |
+| `catalog_get` | one endpoint in full: params, cost, reliability, sibling providers (the routing plan instead on a routed row, as in the CLI) |
 | `call` | a catalog endpoint by id, or `<tool-name>/<path>` for the team's own tool |
 | `call_media` | the same `/call/` path for audio endpoints, returned as native `AudioContent` plus structured call/cost metadata |
 | `resources_list` | calls the unified provider-resource API; Fish voice listing uses the connected Fish account when BYOK exists, otherwise the active team's platform voices |
@@ -219,7 +227,14 @@ capability pins, per-member tool access, the credential ladder, metering) live i
 second path that "just read the database" would be a second implementation of every one of them,
 drifting quietly. The in-process client stamps `X-Treg-Client: mcp` for the team MCP and
 `X-Treg-Client: claude-connector` for V2 (attribution, never a gate), so each MCP surface is
-distinguishable from unreported CLI traffic and from the other MCP surface.
+distinguishable from unreported CLI traffic and from the other MCP surface. It also forwards the
+host behind the tool call, as `_bearer` read it: `X-Treg-Mcp-Client` (`clientInfo.name`) and
+`X-Treg-Mcp-User-Agent` (the inbound User-Agent), on both MCP surfaces. `tool_called` and
+`call_intake_failed` record them as `mcp_client` and `mcp_user_agent`, and only when `X-Treg-Client`
+names an MCP surface, so a direct `/call/` cannot pose as an MCP host. The stateless transport keeps no `initialize`, so `clientInfo` is known only on a
+2026-07-28+ request, which carries it on every request; older clients are told apart by User-Agent.
+The internal request keeps httpx's own User-Agent, since that is what an own-key upstream sees, and
+relay drops every `x-treg-*` header before the upstream.
 
 The catalog is the one exception: read straight from `catalog_store`, which is already parsed in
 memory, so a search answers in about a millisecond. That is a **speed** choice, not a permission one.

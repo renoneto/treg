@@ -11,6 +11,12 @@ sources:
   - src/treg/domain/asynctasks/__init__.py
   - src/treg/models.py
   - src/treg/application/billing.py
+  - src/treg/routers/billing.py
+  - frontend/src/state/billing.js
+  - frontend/src/state/data.js
+  - frontend/src/pages/TeamPage.vue
+  - src/treg/application/enterprise_billing.py
+  - src/treg/routers/enterprise_sso.py
   - src/treg/application/call/idempotency.py
   - src/treg/application/call/intake.py
   - src/treg/application/call/resolve.py
@@ -55,6 +61,7 @@ sources:
   - tests/test_archive_batch_postgres.py
   - scripts/bench_money_admission.py
   - tests/test_marketplace_call.py
+  - tests/test_anyapi_cost_ceiling.py
   - tests/test_asynctasks.py
 related:
   - architecture/catalog.md
@@ -64,6 +71,42 @@ related:
 ---
 
 # Money
+
+## Enterprise SSO subscription
+
+The team dashboard displays the amount of each active flat monthly USD Stripe Price.
+`TREG_ENTERPRISE_SSO_BUNDLE_ONLY=false` exposes both plans; the default exposes only the bundle.
+Each offered plan needs a reusable Stripe Price ID
+(`TREG_ENTERPRISE_SSO_BUNDLE_PRICE_ID`, or `TREG_ENTERPRISE_SSO_ONLY_PRICE_ID` when enabled).
+`billing.catalog` reads Prices outside a database session and hides unusable or unconfigured plans;
+the API returns integer cents and the Price ID for display. A deployment may set separate minimum
+monthly USD prices for the two plans; a cheaper Price is hidden and rejected at checkout.
+`billing.status` reads existing subscription state without Stripe I/O for entitled teams, and
+never fetches Prices for non-owner callers, so a Price API failure cannot hide setup or cancellation
+controls or delay a member's team page. `billing.start_checkout` rejects a
+stale Price ID from an older page, then retrieves the configured Price again
+outside a database session and verifies its active state, flat fee, USD currency, and monthly interval
+before sending that Price ID to Checkout. This avoids creating a new Stripe
+Product and Price for every team. A pricing change creates a new Price ID for future checkouts;
+existing subscriptions retain their original Price unless explicitly migrated.
+The existing signed billing webhook records subscription status and gates WorkOS setup/sign-in on
+`active`, `trialing`, or `past_due` while Stripe retries; a redirect from Checkout grants nothing. Subscription metadata binds the
+event to a team and plan, and the Stripe customer must match that team. Older Stripe events cannot
+restore an entitlement after a later cancellation. Owners can schedule cancellation at period end;
+Checkout uses one pending reservation per team and an idempotent Stripe session request, so
+concurrent clicks cannot create parallel subscriptions. When paid entitlement ends, enforcement
+is lifted; `past_due` retains SSO and Directory Sync while Stripe retries payment. Cancellation
+removes only SSO-created memberships and their keys. Pre-existing members
+keep their memberships. Team deletion
+waits until the subscription has ended. This subscription never credits or debits the
+prepaid tool-call balance, so the five ledger entry kinds remain unchanged.
+Payment history combines prepaid top-ups and SSO subscription invoices. A paid SSO invoice can
+also link to its Stripe receipt when its successful Charge has a receipt URL. A missing receipt
+never hides the invoice; zero-amount or non-card invoices may have no receipt.
+After the paid period ends, the enterprise cleanup worker deletes every WorkOS connection and
+directory belonging to the team's verified WorkOS organization. It retries failures and prevents
+a new checkout or team deletion until cleanup finishes, without holding a database connection
+across WorkOS I/O.
 
 TrestleIQ charges USD 0.015 for Phone Validation, USD 0.03 for Real Contact, and USD 0.01 for
 Address Validation. Every HTTP 200 response is billable, including a negative verdict; 4xx and 5xx
@@ -310,7 +353,24 @@ cancellation before allowing the admission scope to exit, then propagates cancel
 original failure. It does not introduce a commit or change the application's commit boundaries.
 Waiting for admission holds no database connection.
 
-`money_admission_wait_s` accepts `0 < wait <= 120` seconds and still defaults to five.
+`money_admission_wait_s` accepts `0 < wait <= 120` seconds and still defaults to five. It is the
+`reserve` budget. Every other operation (`close`, `deferred`, `async`, `hub`, `release`) waits
+`max(money_admission_wait_s, 2 * money_admission_lease_s)`: a holder that dies keeps its lease for
+at most one TTL, and two cover that plus one live session. A reserve can shed load with a 429;
+a settlement cannot, and one that enters the database without the lease queues on the payer's
+CreditBlock row lock while holding a pooled connection. That wait never exceeds half of
+`hold_grace_s`: the reaper returns a hold older than `call_timeout_s + hold_grace_s`, so a call that
+finishes at its upstream timeout must still settle inside the grace, and the other half is left for
+the settlement session. That bound alone does not cover a hold that is already old: a routed call
+leaves its children's holds open until the whole waterfall ends. So the call application records
+`reserved_at` (a monotonic time taken before the reserve, never after the hold's creation) on
+`MarketplaceCall` and each `DeferredSettle`, and `close`, deferred batches and cancellation release
+pass `max_wait_s = hold_ttl_s() - age of the oldest affected hold - hold_grace_s / 2`. The Hub
+runner records the same time before its price reserve and applies it when it closes the price hold:
+a manifest's wall limit does not keep that hold young when `call_timeout_s` is set low. A hold
+near its reaper age therefore falls back at once instead of queueing. A caller with its own
+deadline passes `max_wait_s`, a hard cap on the wait (zero or less falls back at once). The asynchronous worker passes what remains of the row's
+processing deadline (started before the claim) minus the time it keeps for the settlement session.
 One acquisition deadline covers local-lock waiting and all Redis acquisition attempts; reaching
 Redis does not restart the budget. This is a per-admission wait, not a total call deadline: a
 request can reserve and later settle through separate admission scopes. Cleanup and database
@@ -358,9 +418,10 @@ retains `X-Treg-Error: 1`; both MCP surfaces expose the status, body and `retry_
 The feature defaults off; `money_admission_org_ids` selects an opt-in subset, or all orgs when
 empty and enabled. Non-selected operations supply the disabled timing baseline. Admission never
 replaces Hold claims, CreditBlock locks or transaction atomicity. For `close`, `deferred`, `async`,
-and `hub`, a missing identity, unavailable Redis, or expired acquisition budget releases any
-partially acquired gates and executes the original database path. `release` keeps that wait-budget
-fallback so financial cleanup still runs. Every operation, including `reserve`, retains fallback
+`hub` and `release`, a missing identity, unavailable Redis, or expiry of the wider acquisition
+budget releases any partially acquired gates and executes the original database path, so
+settlement and financial cleanup still run; it never raises. Store failures fall back at once,
+without the wider wait. Every operation, including `reserve`, retains fallback
 on Redis infrastructure errors, an unconfigured store or lease loss. A store-raised timeout is
 an infrastructure error, distinguished from expiry of the gate's own acquisition budget.
 Lost renewal does not cancel or restart a money transaction already in
@@ -404,7 +465,7 @@ A retry finding no matching token reports `not_owned`: an earlier delete may hav
 without its response, or the lease expired/changed owners. It cannot delete a replacement owner's
 lease and does not manufacture a new lease-loss observation. Repeated failures leave expiry as
 the backstop. Cleanup still follows database session closure and never repeats accounting or
-upstream work. The admission acquisition budget still defaults to five seconds; cleanup is observed
+upstream work. The reserve acquisition budget still defaults to five seconds; cleanup is observed
 separately from execution in the existing scope totals.
 
 This is best-effort contention isolation, not a global money concurrency cap, durable queue or
@@ -433,7 +494,7 @@ Pending `AsyncTaskRecord` holds are excluded from this short request reaper. The
 ## Deferred asynchronous settlement
 
 `domain/money/settlement.py` is the single data-derived calculation seam. Reserve time freezes a basis
-with `when: response|terminal` and `amount.kind: table|usage|observed`; `settle(basis, evidence)` returns
+with `when: response|terminal` and `amount.kind: table|usage|observed|terminal_presence`; `settle(basis, evidence)` returns
 raw integer micro-USD and never writes the ledger. `table_amount_micro` bounds a `times` multiplier by
 the field's declared `min`/`max` (finite and always positive, whatever minimum is declared): an out-of-range value
 matches no row and prices at the fallback, so a caller can neither reserve zero nor bill past the
@@ -445,7 +506,13 @@ finished answer is charged for each one, a finished answer with no result includ
 that bills on submission has the reported charge frozen into the basis
 (`submission_charge_micro`), and an `observed` settle uses it when the terminal answer reports
 none, `billed_failure` included: the task bills what the provider charged, not the estimate. Async
-`per_success` rows without a table keep settling on the submission response.
+`per_success` rows without a table keep settling on the submission response unless they declare
+`settle: terminal_presence`. That bounded mode freezes a field path in either a one-item result
+row or a root result object, holds one result's price, and settles zero when that field is absent
+or empty. An
+optional `presence.request_field` marks a supplied billable input at submission, so it settles the
+hold even when the terminal result omits that field. A missing
+or malformed terminal result settles the reserve; a confirmed terminal failure releases the hold.
 
 A submission whose own status is already a success word, on a descriptor with
 `terminal_on_submission`, is not deferred: it settles on the response through the ordinary path.
@@ -473,7 +540,9 @@ billable work without manufacturing a successful result.
 
 Routed tools and Enrich Arena may wait for an async child through the shared async bridge. Every
 poll still uses the ordinary call path, so BYOK remains unmetered and platform polls enforce task
-ownership. Foreground polling and the worker may observe the same terminal response, but the task
+ownership. Server-created polls continue the admitted submission without another quota check or
+increment; direct caller-initiated polls remain separate calls. Quota or other poll failures after
+a task ID exists preserve that handle and the pending reservation. Foreground polling and the worker may observe the same terminal response, but the task
 row lock lets only one close the original hold. A foreground timeout or inconclusive poll response
 returns a pending result with the reservation still open; the worker later settles or releases it.
 Terminal UI and routed results read the task's settled amount, while pending results expose only the
@@ -568,10 +637,7 @@ it. The one exception is the off-session auto-top-up charge, where the server it
 PaymentIntent's confirmed status - nothing attacker-supplied is involved - so it credits immediately
 and the webhook redelivery lands as a no-op.
 
-The webhook lives at `POST /billing/stripe/webhook`, **deliberately separate from the landing demo's
-`/stripe/webhook`** and signed by a different secret: they are different Stripe accounts' events with
-different consequences, and sharing a path would let one secret authorize the other's effects. It
-**404s when unconfigured**, so a deploy without the secret exposes no unauthenticated POST surface.
+The webhook lives at `POST /billing/stripe/webhook`. It **404s when unconfigured**, so a deploy without the secret exposes no unauthenticated POST surface.
 `verify_event` uses the SDK's `verify_header` (timestamp tolerance = replay protection, and it handles
 the several-signatures case during rotation) rather than `construct_event`, so a genuine event of a
 type this SDK version predates is accepted and then ignored, not rejected as forged. A handler failure
@@ -719,7 +785,7 @@ PaymentIntent is the payment. Note also that invoice creation can be **priced se
 and Stripe invoice emails depend on Customer emails → Successful payments being enabled in the
 dashboard. treg's own receipt email is sent independently.
 
-**`list_payments` reads rows from us and documents from Stripe.** The payment list is built from our
+**`get_payment_history` merges top-ups and SSO invoices for the Team Billing tab.** The top-up rows are built from our
 own `CreditBlock` rows - the same table the balance is computed from, so the history can never show a
 payment the balance disagrees with, and amounts and dates need no network call. Stripe is asked only
 for the links, in two list calls (`Charge.list` + `Invoice.list`, joined through invoice payments or
@@ -727,8 +793,14 @@ the legacy charge invoice field) rather than two
 per row; a failure degrades to rows without links and reports `stripe_ok: false`, because a Stripe
 hiccup should cost the payer a download button, not their payment history. Both Stripe windows cap at
 100 payments, so a very old top-up on a busy account comes back link-less - the portal is the
-unbounded archive. The dashboard marks these credited payments Paid and shows separate invoice and
-Stripe receipt links when each exists; the invoice PDF can still show the amount originally due.
+unbounded archive. SSO invoice rows use Stripe's own total, status and document links, and never
+add to the prepaid balance. `_subscription_invoices` scans the team's Stripe customer invoices and
+selects invoices whose subscription metadata identifies this team (or whose subscription ID matches
+its current SSO subscription); this includes an earlier subscription after cancellation and
+re-purchase without mixing in top-up invoices. The API's `kind` filter and per-source cursor build
+one newest-first page across both kinds; the dashboard has All, Manual top-ups, Auto top-ups and
+Subscriptions filters with Previous/Next controls. Stripe invoice failure is reported separately
+as `subscription_invoices_ok: false` while the ledger-backed top-ups remain visible.
 
 **`create_portal_session` is the self-serve surface** for card, billing address, tax ID and the full
 invoice archive: hosted, because every one of those is a form we would otherwise own and the tax-ID
@@ -863,7 +935,10 @@ on it (at least one team), and a run that dies holds the lease only until it exp
 The metered path is `_platform_offer` → spend caps → `ledger.reserve_in_transaction` →
 application commit → relay → settle or release. Settlement uses the frozen basis and provider
 evidence through `_observed_cost_micro`; it falls back to the estimate when evidence is unavailable.
-Provider-specific calculation stays outside the faithful relay.
+Provider-specific calculation stays outside the faithful relay. Two pure functions hold the
+arithmetic: `resolve.price_call` (estimate, units, frozen basis) and `settle.decide_settle` (charge
+or release, and how much, before any ledger write); the replay engine calls the same two
+(architecture/replay.md).
 
 | Evidence | Settlement behavior |
 |---|---|
@@ -928,6 +1003,17 @@ export really does cost 5,000 keywords. Before this the 20-row default billed a 
 2026-08-12, refunded by hand — and the same number was the catalog's `~$/call` display, so the caller
 saw the wrong price before the call too. On these providers nothing reports a cost after the fact,
 so the reserve IS the charge: a wrong entity count is a wrong bill, not a hold the settle trues up.
+That inference reads the unit name, and a unit name cannot tell "per keyword asked" from "per
+keyword returned": a row billed per returned row in an entity unit held one entity and settled at
+most that. A row that declares `cost.reserve` (architecture/catalog.md) skips the inference and both
+page bounds; its counted settle (`cost.settle.count`) is capped at the hold like every row count, so the
+caller's ceiling and the balance check at reserve still bound the charge.
+
+Fiber natural-language search (`fiber-ai.people.search.natural_language`) adds a fee the page size
+does not name. `_marketplace_pricing` adds two credits, converted with `_usd_to_micro` at the
+`fx.yaml` fiber-ai rate, when the JSON body has no non-empty `pageToken` (absent, null, or blank).
+A later page that sends `pageToken` reserves only the requested page. Settlement is unchanged: it
+still reads `chargeInfo.creditsCharged`.
 
 The estimate is never a substitute for an available response-derived charge.
 
@@ -1042,15 +1128,17 @@ still pay the provider twice.
   Neither a global nor an org-wide key safely separates independent callers.
 - A short application transaction claims a pending row before relay. The unique constraint
   arbitrates concurrent claims; the loser gets 409. Reusing a label with another fingerprint is 422.
-- Metered successes retain status, body, charge and call id for 24 hours. Uncharged failures
-  (every routed failure since routed children defer their holds to the parent, catalog.md), BYOK
+- Metered successes retain status, body, charge and call id for 24 hours. A catalog endpoint with
+  `response_retention: forbidden` instead keeps a body-free 410 receipt with the call id and charge,
+  including for BYOK, so the same key cannot repeat the provider call. Uncharged failures (every
+  routed failure since routed children defer their holds to the parent, catalog.md), other BYOK
   calls and owned free polls release the label immediately, so a retry tries again.
 - Replays return `X-Treg-Idempotent-Replay: true`, `X-Treg-Cost-Micro: 0` (nothing new was charged,
   so a client summing the header stays right) and the first call's figure in
   `X-Treg-Original-Cost-Micro`; MCP returns `replayed: true`. An async submission replay echoes its
   original reservation there.
 - Refusal and cancellation cleanup return an acquired label. Expired entries are swept lazily,
-  scoped to the caller, at claim time.
+  scoped to the caller, at claim time, skipping rows a concurrent request has locked.
 
 A reserve admission 429 never reaches `_store_idempotent`; the HTTP exception handler's
 `_stamp_call_exit` releases its pending claim, including calls from either MCP surface. The same
@@ -1263,7 +1351,19 @@ check (`X-Treg-Route-Verify`, catalog.md) is one more such child: it gets what t
 its refusal leaves the find charged and the check unrun. A refusal is a 402
 `route_max_cost` and moves no money for that attempt. Overflow inherits the same field via its
 child snapshot and checks its own estimate; a preceding direct charge reduces the remainder.
-This is a pre-reservation guard, not a rewrite of provider-reported settlement evidence.
+
+When the catalog declares `ceiling_param` (`{in: query, name, unit: usd}` on the provider file, or
+on that endpoint's `cost`), and `max_cost_micro` is set, and the caller did not already send that
+query name, the call application appends `name=<USD>` to the outbound query before `relay()`. The
+USD figure is the largest provider charge that still settles within the caller's ceiling after
+`with_margin` (which rounds up). At margin 0 that is the ceiling itself. AnyAPI's parameter is
+`max_cost_usd`: the provider refuses a source dearer than that price with HTTP 400
+`max_cost_exceeded` and no charge, so a failover cannot settle above the ceiling. That 400 stays a
+non-2xx uncharged relay; a routed waterfall treats it as a failed attempt and may move on. An
+explicit caller value is never rewritten. The appended pair is not part of the inbound query, so
+it does not change `params_hash` or the archive key. For every other provider the ceiling remains
+a pre-reservation guard: provider-reported settlement can still exceed the estimate the guard
+checked.
 
 ## Overflow money
 
@@ -1317,6 +1417,8 @@ delayed account balance, so neither field is interpreted as per-call cost.
 
 HTTP 200 alone does not prove a billable success. `settle.py` checks the catalog's `expect` rule
 (`{json_path, equals}`) first, then the routing adapter, and otherwise falls back to the estimate.
+A value in the rule's optional `misses` list settles at zero like any other non-`equals` value;
+it only stops the hit verdict from calling a free miss a provider failure.
 `store.py` inherits provider-file `expect` rules onto endpoints so new routes retain the provider's
 success convention. An undecidable rule does not imply a free call.
 

@@ -61,6 +61,14 @@ Streaming retains the root slot through response cleanup. Routing children do no
 additional root slots or rate tokens. Published null disables its limit; legacy environment
 maps have no effect.
 
+The separate [exact org/endpoint allowance](org-endpoint-quota.md) runs inside the shared call
+application after canonical resolution and local/money admission, immediately before returning
+a cache hit or sending a direct/overflow request. It counts logical admissions across credential
+tiers and releases unused holds on refusal. An exhausted child may be skipped for another routed
+candidate. Redis uncertainty allows calls, including previously restricted targets, without
+repairing counters; operators can set limits again after loss. Optional verification preserves
+the find result on a known refusal.
+
 Named catalog calls with authorization metadata select the provider and grant method before
 comparing hosts. This separates Facebook and Instagram tools sharing `graph.facebook.com`;
 the resulting tool enters the same relay without provider-specific relay logic.
@@ -108,6 +116,9 @@ incl. duplicates, headers, cookies, body bytes):
    This is semantic JSON relay, not byte-faithful relay: formatting changes, non-ASCII text is
    emitted as UTF-8, and duplicate keys fail closed. Never use a JSON binding where the upstream
    signs or hashes the caller's raw body bytes.
+   On a connection to treg's own Meta app the credential includes an `appsecret_proof` query
+   parameter (HMAC of the injected token with the app secret) that replaces any caller value; see
+   auth-secrets.md for when one is owed.
 
    **Every JSON re-encode goes through `treg/jsontext.py`.** `json.loads` accepts an escaped lone
    UTF-16 surrogate (`"\ud835"`, a JavaScript scraper cutting a LinkedIn post mid-pair) and a plain
@@ -116,6 +127,11 @@ incl. duplicates, headers, cookies, body bytes):
    hub's child bodies and `treg --json call` relay the upstream's own escape. MCP is the one lossy
    surface: the SDK's pydantic serializer cannot write the escape, so `mcp._body` replaces each
    unpaired surrogate with U+FFFD (paired text is unchanged) rather than lose the paid answer.
+
+A catalog `ceiling_param` is appended by the call application onto `UpstreamRequest.query_items`
+before `relay()`, and only when the call carries a caller ceiling the caller did not already send
+under that name. `relay()` forwards that list verbatim. The pair is absent from the inbound query,
+so it does not enter `params_hash` or the archive key.
 
 > **What treg keeps from a call.** Successes retain no content: the relay forwards bytes and the audit
 > row records status, size and timing. A **failed relayed call** - platform, own-key, or plain own-tool
@@ -332,7 +348,10 @@ status and detail. Provider failures remain response data. Header contracts are 
 After credential refresh and relay, `_audit` records the attempt and mirrors it through
 `_tool_called_props` / `analytics.capture`. Provider identity is the catalog provider or the
 own tool's upstream host. Analytics includes outcome, status, timing, cost, call reference,
-capacity/cache/smoothing signals and user-agent attribution, never params or bodies.
+capacity/cache/smoothing signals and user-agent attribution (plus the MCP host for a call made
+through either MCP surface), and from the CLI its release (`client_version`), hashed session
+(`session`) and agent label (`agent`), each from its `X-Treg-*` header, truncated, null when
+absent. Never params or bodies.
 
 `domain.catalog.results.classify` shares verified hit/miss rules between business-hit telemetry
 and cache admission. Found means `hit=true`, explicit empty means false, and errors/unknown
@@ -423,7 +442,9 @@ child's reserve. The parent - not each child - decides whether the caller pays, 
 closes every child's hold exactly once with `settle.close_deferred(charge=…)`: `charge=True` settles
 each billable child as its own settle would have, `charge=False` releases all of them, because a
 routed call that fails charges the caller nothing. A crash before `close_deferred` runs leaves the
-holds to the reaper, which releases in the caller's favour. The parent only assembles
+holds to the reaper, which releases in the caller's favour. Each child's answer is read by
+`route.child_outcome` (declared miss, not found, rejected, error, adapter error, miss or hit),
+which the replay engine also calls (architecture/replay.md). The parent only assembles
 `{output, raw, _treg}` and owns the idempotency label.
 
 A routed call whose outcome is still pending (`202` with `X-Treg-Route-Outcome: pending`) leaves
@@ -553,8 +574,9 @@ refusal:
    `view.rate_bucket`); it replaces the provider's limit for that route and does not draw from the
    provider's bucket. Each account other than the primary has its own allowance, so its own
    bucket (`<key>#<label>`). In-process on purpose: a second replica
-   doubles the effective rate, and the `rate_pressure` alert (step C) is the answer to that, not a
-   shared counter on the request path.
+   doubles the effective rate. A shared window over the same buckets can run beside it in observe
+   mode (`TREG_PROVIDER_RATE_MODE=observe`, [capacity](../ops/capacity.md)), which logs what it
+   would refuse and refuses nothing.
 2. **One bounded `retry-after` re-send** - on a tier-4 **429** classified `burst` with
    `retry-after ≤ 5 s` (`SMOOTHING_RETRY_MAX_S`), for a **body-less GET/HEAD only**: close the first
    response, sleep, send the identical `UpstreamRequest` once more on the same hold, settle on the
@@ -748,9 +770,11 @@ a web process. The endpoint instead declares `spooled_response: true` and
 
 Catalog entries can opt into `strict_query`: `_enforce_catalog_query` rejects bodies,
 undeclared/duplicate query parameters, missing required inputs and unsupported enum values before
-credential selection. They can separately opt into `body_allowlist`: `_enforce_catalog_body`
+credential selection. A declared path placeholder is allowed through this check and consumed
+before relay; undeclared query fields remain rejected. They can separately opt into `body_allowlist`: `_enforce_catalog_body`
 rejects undeclared top-level JSON fields, missing required fields, invalid declared scalar values,
-and arrays outside their declared cardinality or item enum. An omitted optional array is allowed;
+and arrays outside their declared cardinality or item enum. An array of objects may require every
+named item field or at least one named item field without rewriting the item. An omitted optional array is allowed;
 its cardinality applies only when the caller supplies it. Both checks apply to catalog calls on every
 tier, leave unmarked entries unchanged and do not constrain arbitrary raw own-tool relays. Legacy
 `resource_ownership.requires` accepts a declared body

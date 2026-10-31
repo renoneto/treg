@@ -10,7 +10,6 @@ from treg import crypto
 from treg.application import arena
 from treg.application.call import service
 from treg.domain import arena as rules
-from treg.domain.catalog import store as catalog_store
 from treg.infra.db import session_maker
 from treg.models import ArenaEvaluation, ArenaRun, AsyncTaskRecord, Hold, LedgerEntry
 from treg.timeutil import utcnow_naive
@@ -329,7 +328,10 @@ async def test_public_page_and_tasks_but_no_anonymous_spending(clients):
     work = next(t for t in tasks if t["id"] == "people.email.find")
     names = work["provider_previews"][0]
     assert all(isinstance(p["estimate_micro"], int) and p["estimate_micro"] >= 0 for p in names)
-    assert all(p["price_type"] == "per_success" for p in names)
+    from treg.domain.catalog import store as catalog_store
+    catalog = catalog_store.load()
+    assert all(p["price_type"] == catalog.by_id[p["endpoint_id"]]["cost"]["type"] for p in names)
+    assert any(p["provider"] == "orbisearch" and p["price_type"] == "per_call" for p in names)
     async with session_maker() as db:
         assert not (await db.execute(select(ArenaRun))).scalars().all()
         assert not (await db.execute(select(Hold))).scalars().all()
@@ -1037,12 +1039,16 @@ def test_search_outputs_are_bounded_sanitized_and_survive_presentation():
 
 
 async def test_people_search_executes_a_bounded_direct_query(clients, enrichment_on, monkeypatch):
+    from treg.config import get_settings
+    monkeypatch.setenv('TREG_PLATFORM_KEY_EXA','PLATFORM-EXA-KEY')
+    monkeypatch.setenv('TREG_PLATFORM_PROVIDERS','hunter,tomba,leadmagic,leadsforge,findymail,aviato,fiber-ai,exa')
+    get_settings.cache_clear()
     seen=[]
-    monkeypatch.setattr(service,'relay',_relay_by_provider({'aviato':[(200,{'items':[{'fullName':'Example Person','headline':'Engineer','linkedinUrl':'https://www.linkedin.com/in/example'}]})]},seen))
-    response=await clients.post('/arena/plans',json={'capability':'people.search','identity':{'q':'software engineer'},'providers':['aviato'],'mode':'compare','max_cost_micro':1_000_000})
+    monkeypatch.setattr(service,'relay',_relay_by_provider({'exa':[(200,{'results':[{'name':'Example Person','title':'Engineer','url':'https://www.linkedin.com/in/example'}]})]},seen))
+    response=await clients.post('/arena/plans',json={'capability':'people.search','identity':{'q':'software engineer'},'providers':['exa'],'mode':'compare','max_cost_micro':1_000_000})
     assert response.status_code==200,response.text
     result=await finish(clients,response.json())
-    assert seen[0][3]['dsl']['limit']==10
+    assert seen[0][3]['numResults']==10
     row=result['results'][0]
     assert row['state']=='hit' and row['output']['count']==1
     assert row['output']['people'][0]['name']=='Example Person'
@@ -1370,15 +1376,8 @@ def test_issue_requires_completed_explicit_negative_email_verdict(task,state,sta
     assert rules.verification_rejected_email(attempt,'people.email.find') is expected
     assert not rules.verification_rejected_email(attempt,'people.phone.find')
 
-def _serve_contactout_verify(monkeypatch):
-    """The catalog blocks ContactOut's verifier on treg's key; these tests need a free verifier
-    first in the routed fallback, and it is the only free one."""
-    ep = catalog_store.load().by_id['contactout.people.email.verify']
-    monkeypatch.setitem(ep, 'platform_blocked', '')
-
 async def test_new_free_verifier_is_selected_for_auto_verification(clients, enrichment_on, monkeypatch):
     from treg.config import get_settings
-    _serve_contactout_verify(monkeypatch)
     monkeypatch.setenv('TREG_PLATFORM_PROVIDERS','tomba,contactout,trykitt,millionverifier')
     for name in ['CONTACTOUT','TRYKITT','MILLIONVERIFIER']:
         monkeypatch.setenv('TREG_PLATFORM_KEY_'+name,'SYNTHETIC-VERIFICATION-KEY')
@@ -1401,7 +1400,6 @@ async def test_new_free_verifier_is_selected_for_auto_verification(clients, enri
 @pytest.mark.parametrize('verdict', ['valid', 'invalid', 'catch_all'])
 async def test_email_verification_uses_routed_fallback_and_accounts_for_children(clients, enrichment_on, monkeypatch, automatic, first_response, verdict):
     from treg.config import get_settings
-    _serve_contactout_verify(monkeypatch)
     monkeypatch.setenv('TREG_PLATFORM_PROVIDERS','tomba,contactout,leadmagic')
     monkeypatch.setenv('TREG_PLATFORM_KEY_CONTACTOUT','SYNTHETIC-VERIFICATION-KEY')
     get_settings.cache_clear()

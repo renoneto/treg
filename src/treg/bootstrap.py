@@ -23,7 +23,7 @@ from starlette.routing import BaseRoute, Mount
 
 from . import adsconv, analytics, archive, audit, call_events
 from .application.call import route as routed_call
-from .application import arena, find_index
+from .application import arena, find_index, media
 from . import bootstrap_handlers, policy
 from .bootstrap_http import (
     _BodyDecodeMiddleware,
@@ -34,7 +34,7 @@ from .bootstrap_http import (
 from .config import TREG_USER_AGENT, get_settings
 from .infra import kv, money_timing, org_traffic, turnstile
 from .infra.money_trace_runner import start_money_trace, stop_money_trace
-from .infra.db import background_session_maker, verify_db
+from .infra.db import ReportBusy, background_session_maker, verify_db
 from .infra.catalog_observations import (
     CachedEndpointObservationReader,
     PostgresEndpointObservationReader,
@@ -139,6 +139,11 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/auth/cli/approve', ('POST',), 'auth_cli_approve'),
     ('/login', ('GET',), 'login_page'),
     ('/auth/me', ('GET',), 'auth_me'),
+    ('/auth/sso/callback', ('GET',), 'sso_callback'),
+    ('/auth/sso/discover', ('POST',), 'sso_discover'),
+    ('/auth/sso/idp/start', ('GET',), 'sso_idp_start'),
+    ('/auth/sso/workos/webhook', ('POST',), 'sso_workos_webhook'),
+    ('/auth/sso/{org_slug}/start', ('GET',), 'sso_start'),
     ('/auth/logout', ('POST',), 'auth_logout'),
     ('/auth/email/start', ('POST',), 'auth_email_start'),
     ('/auth/email/verify', ('POST',), 'auth_email_verify'),
@@ -155,6 +160,8 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/sitemap.xml', ('GET',), 'sitemap_xml'),
     ('/7c2e4a91b5d3f8e6treg2026.txt', ('GET',), 'indexnow_key'),
     ('/install.sh', ('GET',), 'install_sh'),
+    ('/i/{code}', ('GET',), 'install_sh_linked'),
+    ('/i', ('POST',), 'ad_link_mint'),
     ('/selfhost.sh', ('GET',), 'selfhost_sh'),
     ('/quickstart.md', ('GET',), 'quickstart_md'),
     ('/tutorial.md', ('GET',), 'tutorial_md'),
@@ -169,6 +176,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/skills/web-access/SKILL.md', ('GET',), 'web_access_skill_md'),
     ('/skills/recruit/SKILL.md', ('GET',), 'recruit_skill_md'),
     ('/skills/jev-memory/SKILL.md', ('GET',), 'jev_memory_skill_md'),
+    ('/skills/rea-growth/SKILL.md', ('GET',), 'rea_growth_skill_md'),
     ('/feedback.md', ('GET',), 'feedback_md'),
     ('/favicon.ico', ('GET',), 'favicon'),
     ('/favicon.svg', ('GET',), 'favicon'),
@@ -185,6 +193,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/resources', ('GET',), 'resources_page'),
     ('/blog', ('GET',), 'blog_index'),
     ('/blog/people-search-bench', ('GET',), 'blog_people_search_bench'),
+    ('/blog/security-incident-2026-10-23', ('GET',), 'blog_security_incident_2026_10_23'),
     ('/blog/work-email-finding-bench', ('GET',), 'blog_work_email_finding_bench'),
     ('/grokbot', ('GET',), 'grokbot_page'),
     ('/fable', ('GET',), 'fable_page'),
@@ -192,6 +201,8 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/gpt6', ('GET',), 'gpt6_page'),
     ('/ugc', ('GET',), 'ugc_page'),
     ('/aeo', ('GET',), 'aeo_page'),
+    ('/rea-growth', ('GET',), 'rea_growth_page'),
+    ('/rea-growth.md', ('GET',), 'rea_growth_md'),
     ('/showcase', ('GET',), 'showcase_page'),
     ('/showcase/leaderboard', ('GET',), 'showcase_leaderboard'),
     ('/showcase/votes/me', ('GET',), 'showcase_my_votes'),
@@ -212,6 +223,8 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/admin/showcase/apps/{app_id}', ('PATCH',), 'staff_edit'),
     ('/admin/showcase/teams/{org_id}/apps', ('POST',), 'staff_create'),
     ('/admin/showcase/teams/{org_id}', ('GET',), 'staff_team'),
+    ('/rankings', ('GET',), 'rankings_page'),
+    ('/rankings/data/{board}', ('GET',), 'rankings_board'),
     ('/admin/images/{kind}', ('POST',), 'staff_upload'),
     ('/admin/images/staging/{key:path}', ('GET',), 'staff_staged_image'),
     ('/images/{kind}', ('POST',), 'upload_image'),
@@ -257,6 +270,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/oauth/grants', ('GET',), 'oauth_grants'),
     ('/oauth/grants/{family_id}/team', ('POST',), 'oauth_grant_set_team'),
     ('/orgs', ('GET',), 'list_orgs'),
+    ('/home', ('GET',), 'home'),
     ('/orgs/{org_id}/invites', ('POST',), 'create_invite'),
     ('/invites/accept', ('POST',), 'accept_invite'),
     ('/invites/mine', ('GET',), 'my_invites'),
@@ -266,11 +280,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/onboard/team', ('POST',), 'onboard_team'),
     ('/demo/sandbox', ('POST',), 'demo_sandbox_mint'),
     ('/demo/sandbox/live', ('GET',), 'demo_sandbox_live'),
-    ('/stripe/webhook', ('POST',), 'stripe_webhook'),
-    ('/landing/stripe-feed', ('GET',), 'landing_stripe_feed'),
     ('/demo/sandbox/skill', ('GET',), 'demo_sandbox_skill'),
-    ('/skills/samples', ('GET',), 'skill_samples'),
-    ('/skills/{name}/install.sh', ('GET',), 'skill_install'),
     ('/onboard/seed-tool', ('POST',), 'onboard_seed_tool'),
     ('/onboard/accept-teammate', ('POST',), 'onboard_accept_teammate'),
     ('/invites/{invite_id}/accept', ('POST',), 'accept_my_invite'),
@@ -296,6 +306,14 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/referrals', ('GET',), 'my_referrals'),
     ('/referrals/code', ('POST',), 'mint_referral_code'),
     ('/billing/stripe/webhook', ('POST',), 'billing_stripe_webhook'),
+    ('/orgs/{org_id}/sso', ('GET',), 'sso_status'),
+    ('/orgs/{org_id}/sso/blocked', ('GET',), 'sso_blocked_members'),
+    ('/orgs/{org_id}/sso/blocked/{user_id}/restore', ('POST',), 'sso_restore_member'),
+    ('/orgs/{org_id}/sso/checkout', ('POST',), 'sso_checkout'),
+    ('/orgs/{org_id}/sso/cancel', ('POST',), 'sso_cancel'),
+    ('/orgs/{org_id}/sso/enforce', ('POST',), 'sso_enforce'),
+    ('/orgs/{org_id}/sso/invite-it', ('POST',), 'sso_invite_it'),
+    ('/orgs/{org_id}/sso/setup/{intent}', ('POST',), 'sso_setup'),
     ('/orgs/{org_id}/members/{user_id}/cap', ('PATCH',), 'set_member_cap'),
     ('/orgs/{org_id}/members/{user_id}/access', ('PATCH',), 'set_member_access'),
     ('/usage/me', ('GET',), 'my_usage'),
@@ -380,6 +398,7 @@ _CONTROL_ROUTE_KEYS: frozenset[RouteKey] = frozenset({
     ('/admin/hub/updates', ('GET',), 'admin_hub_updates'),
     ('/admin/hub/updates/{tool_id}', ('POST',), 'admin_hub_update_decide'),
     ('/admin/calls', ('GET',), 'admin_calls'),
+    ('/admin/shadow', ('GET',), 'admin_shadow'),
     ('/admin/share', ('GET',), 'admin_share'),
     ('/admin/daily', ('GET',), 'admin_daily'),
     ('/admin/errors', ('GET',), 'admin_errors'),
@@ -710,6 +729,7 @@ def _lifespan(role: AppRole):
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async with archive_object_store(getattr(app.state, "archive_object_store", None)):
+            media.validate_configuration()
             await verify_db()
             if kv.configured() and not await kv.store().ping():
                 # Not fatal: the store's tenants fail closed (infra/kv.py). Loud, because until it
@@ -751,6 +771,17 @@ def _lifespan(role: AppRole):
             find_task = asyncio.create_task(find_index.warm()) if find_index.enabled() else None
             endpoint_observations = app.state.endpoint_observation_reader
             routed_call.configure_endpoint_observation_reader(endpoint_observations)
+            # Measured verdict quality for X-Treg-Route-Decisive; unset settings keep price order.
+            from .infra import route_quality
+            try:
+                quality_reader = route_quality.from_settings(get_settings())
+            except Exception:  # a bad quality config must never stop serving; the header keeps price order
+                logging.getLogger("treg").warning("event=route_quality_disabled", exc_info=True)
+                quality_reader = None
+            routed_call.configure_route_quality_reader(quality_reader)
+            if quality_reader is not None:
+                from .domain.catalog import store as catalog_store
+                quality_reader.warm(catalog_store.load().contracts)
             mcp_reader_bound = role != "control" and _mcp is not None
             if mcp_reader_bound:
                 _mcp.configure_endpoint_observation_reader(endpoint_observations)
@@ -781,6 +812,7 @@ def _lifespan(role: AppRole):
                     if mcp_reader_bound:
                         _mcp.clear_endpoint_observation_reader(endpoint_observations)
                     routed_call.clear_endpoint_observation_reader(endpoint_observations)
+                    routed_call.configure_route_quality_reader(None)
                     await arena.shutdown()
                     await endpoint_observations.aclose()
                     # analytics LAST: it is the sink the other two report their losses into, and a
@@ -794,6 +826,8 @@ def _lifespan(role: AppRole):
                     await analytics.drain()
                     await app.state.http.aclose()
                     await kv.close()
+                    from .infra import org_endpoint_quota
+                    await org_endpoint_quota.close()
                 finally:
                     if traffic_reporting:
                         org_traffic.stop_reporting()
@@ -843,6 +877,7 @@ def create_app(role: AppRole = "all", *, archive_object_store=None) -> FastAPI:
     app.add_exception_handler(OverflowError, api_module._id_out_of_range)
     bootstrap_handlers._stamp_call_exit = call_routes._stamp_call_exit
     app.add_exception_handler(PoolTimeoutError, bootstrap_handlers._pool_saturated)
+    app.add_exception_handler(ReportBusy, bootstrap_handlers._report_busy)
     app.add_exception_handler(StarletteHTTPException, bootstrap_handlers._mark_treg_own_errors)
 
     _include_role_routes(app, api_module, role)

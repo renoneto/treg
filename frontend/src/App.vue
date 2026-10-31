@@ -154,6 +154,9 @@ export default { ...controller, components: { ...controller.components, ...dialo
          users already in other teams. Decline → create-your-own (first run) or just close. -->
     <AcceptInvitesDialog v-if="inviteChoice && pendingInvites.length" />
 
+    <!-- FIRST-RUN WELCOME: pick your agent → the setup line → a first prompt (the team is already made) -->
+    <WelcomeDialog v-if="welcome.on" />
+
     <!-- CREATE TEAM -->
     <div class="scrim" role="dialog" aria-labelledby="new-team-title" aria-modal="true" v-if="newOrg" v-dialog="() => { newOrg=false }" @click.self="newOrg=false">
       <div class="modal" style="width:min(440px,92vw)"><div class="hd"><b id="new-team-title">Create a team</b><button class="btn sm" @click="newOrg=false" aria-label="Close">✕</button></div>
@@ -180,7 +183,7 @@ export default { ...controller, components: { ...controller.components, ...dialo
     <div class="scrim" role="dialog" aria-labelledby="install-recipe-title" aria-modal="true" v-if="copyRecipe" v-dialog="() => { copyRecipe=null }" @click.self="copyRecipe=null">
       <div class="modal"><div class="hd"><b id="install-recipe-title">Install “{{copyRecipe.name}}”</b><button class="btn sm ico" @click="copyRecipe=null" aria-label="Close">✕</button></div>
         <div style="padding:16px 18px">
-          <div class="tabs"><button v-for="t in ['cURL','CLI','Claude Code']" :key="t" :class="{active:recipeTab===t}" @click="recipeTab=t">{{t}}</button></div>
+          <div class="tabs"><button v-for="t in ['CLI','Claude Code']" :key="t" :class="{active:recipeTab===t}" @click="recipeTab=t">{{t}}</button></div>
           <p class="explain">A recipe is know-how (a <span class="mono">SKILL.md</span>), not an API - you don't call it, you <b>install</b> it into <span class="mono">.claude/skills/</span> so an agent can use it.</p>
           <pre class="code" v-html="recipeSnip.html"></pre>
           <div style="margin-top:12px"><button class="btn primary" @click="copy(recipeSnip.text)">⧉ {{copied?'Copied!':'Copy'}}</button></div>

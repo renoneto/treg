@@ -260,7 +260,7 @@ def _arena_return_target(target: str) -> str:
     except ValueError:
         return ""
     if url.scheme or url.netloc or url.fragment or url.path not in {
-        "/enrich-arena", "/enrich-arena/leaderboard", "/enrich-arena/people-search-bench",
+        "/enrich-arena", "/enrich-arena/leaderboard", "/enrich-arena/people-search-bench", "/web-arena",
     }:
         return ""
     params = parse_qsl(url.query, keep_blank_values=True)
@@ -417,6 +417,7 @@ _CLI_HTTP_ERRORS = {
     "too_many_wrong_codes": (400, "too many wrong codes — run `treg login` again"),
     "wrong_code": (400, "that code doesn't match the one in your terminal"),
     "not_member": (403, "not a member of that team"),
+    "sign_in_through_sso": (403, "sign in through this team's SSO"),
     "unavailable": (503, "login storage unavailable — please try again"),
 }
 
@@ -452,20 +453,28 @@ async def auth_cli_approve(
 
 
 @app.get("/login", include_in_schema=False)
-async def login_page(request: Request, cli: str = "", treg_session: str = Cookie(default="")):
+async def login_page(request: Request, cli: str = "", ad: str = "", treg_session: str = Cookie(default="")):
     """The universal sign-in page `treg login` opens: reuses an existing dashboard session with one
     click ("Continue as …"), else offers every configured door — GitHub, Google, email one-time code.
-    The email door is always present, so login works even with no OAuth app configured."""
+    The email door is always present, so login works even with no OAuth app configured.
+
+    `ad` is the short install link's code (`architecture/ads-conversions.md`, "Capture")."""
     if not cli:
-        return RedirectResponse("/app" + ("?" + request.url.query if request.url.query else ""),
+        resp = RedirectResponse("/app" + ("?" + request.url.query if request.url.query else ""),
                                 status_code=302)  # preserve incoming attribution for the SPA
-    if not _LOGIN_ID_RE.fullmatch(cli):
+    elif not _LOGIN_ID_RE.fullmatch(cli):
         return _auth_page("Login failed", "Bad login link. Run <code>treg login</code> again.", ok=False, status=400)
-    s = get_settings()
-    session_email = await auth_use_cases.cli_session_email(treg_session)
-    return HTMLResponse(_login_page_html(
-        cli, session_email=session_email,
-        github=bool(s.github_client_id), google=bool(s.google_client_id)))
+    else:
+        s = get_settings()
+        session_email = await auth_use_cases.cli_session_email(treg_session)
+        resp = HTMLResponse(_login_page_html(
+            cli, session_email=session_email,
+            github=bool(s.github_client_id), google=bool(s.google_client_id)))
+    restored, max_age = await signup.redeem_ad_link(ad)
+    if restored and not request.cookies.get("treg_ad"):
+        resp.set_cookie("treg_ad", restored, max_age=max_age, path="/", samesite="lax",
+                        secure=_is_https(request), httponly=False)
+    return resp
 
 
 def _login_page_html(login_id: str, *, session_email: str | None, github: bool, google: bool) -> str:
@@ -1202,9 +1211,11 @@ token_router = app
 @app.get("/auth/cli-token")
 async def auth_cli_token(
     response: Response,
+    request: Request,
     user: User = Depends(require_identity),
     x_treg_org: str = Header(default=""),
     x_treg_token: str = Header(default=""),
+    treg_session: str = Cookie(default=""),
 ) -> dict:
     """Mint a fresh CLI/bearer token for the authenticated caller (session cookie OR token). Identity
     tokens are signed (`sess.make_identity`); minting the current generation invalidates nothing — it lets
@@ -1223,12 +1234,14 @@ async def auth_cli_token(
     if (claims or {}).get("scope") == sess.BOOTSTRAP_SCOPE:
         raise HTTPException(status_code=403, detail=(
             "complete team selection in the browser — a bootstrap token cannot mint a Default key"))
-    result = await auth_use_cases.issue_cli_token(
-        user_id=user.id,
-        email=user.email,
-        token_version=user.token_version,
-        org_ref=x_treg_org,
-    )
+    try:
+        result = await auth_use_cases.issue_cli_token(
+            user_id=user.id, email=user.email, token_version=user.token_version,
+            org_ref=x_treg_org,
+            sso_org_id=getattr(request.state, "sso_org_id", None),
+        )
+    except auth_use_cases.IdentityLookupError as exc:
+        raise HTTPException(403, str(exc)) from exc
     response.headers["Cache-Control"] = "no-store"
     return result
 
@@ -1245,7 +1258,8 @@ async def auth_revoke_tokens(
     a fresh session cookie + token for the caller, so the device that pressed the button stays signed in
     while every other device is signed out. (Org membership tokens from accept-invite are a separate token
     type and are unaffected — those are revoked by removing the membership.)"""
-    revoked = await auth_use_cases.revoke_identity_tokens(user.id)
+    revoked = await auth_use_cases.revoke_identity_tokens(
+        user.id, sso_org_id=getattr(request.state, "sso_org_id", None))
     resp = JSONResponse({"token": revoked.token, "email": revoked.email, "revoked": True})
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie(sess.COOKIE, revoked.session_cookie, httponly=True,

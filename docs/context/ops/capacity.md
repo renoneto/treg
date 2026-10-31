@@ -26,6 +26,11 @@ sources:
   - tests/test_capacity_smoothing.py
   - src/treg/domain/capacity/fair_share.py
   - tests/test_capacity_fair_share.py
+  - src/treg/infra/provider_concurrency.py
+  - tests/test_provider_concurrency_redis.py
+  - src/treg/domain/capacity/rate_observe.py
+  - src/treg/infra/provider_rate.py
+  - tests/test_capacity_rate_observe.py
   - src/treg/domain/capacity/overflow_seed.json
   - src/treg/infra/upstream/aggregators/__init__.py
   - src/treg/infra/upstream/aggregators/orthogonal.py
@@ -50,6 +55,14 @@ related:
 
 # Provider capacity
 
+Brave Search publishes no API-key-readable credit or usage endpoint. `NO_BALANCE_API` reports
+the prepaid account as dashboard-only; operators read credits and usage in Brave's dashboard.
+The catalog records the documented 50 requests per second, and provider 429 responses still
+flow through the ordinary capacity handling. No automatic dollar threshold can be inferred
+from dashboard-only data.
+`_KNOWN` records the dashboard's enabled auto-reload setting as a manual observation, and
+`_RATE_LIMITS` paces the shared key at the documented 50 requests per second.
+
 Every platform-key slot is either on `BALANCE_ROUTES` (a free collector reads its balance) or on
 `NO_BALANCE_API` (with the reason none exists), under the slot's spelling;
 `test_every_platform_key_has_a_balance_decision` fails a new slot that is on neither. A sweep
@@ -58,6 +71,12 @@ that bills overage rather than refusing (SpyFu's monthly allowance) as informati
 and sums every pool that can pay for a call (Fiber AI's trial and paid pools). Vendors in
 `OVERDRAFT_SERVED` keep serving past zero, so their low balance is informational and `overdrawn`;
 each needs a refusal signature.
+
+TheirStack's free balance route returns allocated `api_credits` and `used_api_credits`. The dashboard
+shows usage against the allocation, so the collector reports the nonnegative difference as remaining
+API credits. The upstream docs label `api_credits` as available, but it does not fall as usage rises.
+The shared key is paced at the paid tier's four requests per second. The funded account was not
+exhausted to capture a provider-specific 402 body.
 
 Octen's PAYG balance has no account balance or usage endpoint in its published OpenAPI, so
 `NO_BALANCE_API` reports it as dashboard-only. `_KNOWN` classifies the account as manually funded
@@ -78,7 +97,7 @@ the row is `no_api`.
 Litescrape's internal collector reads the free `GET /api/keys/status` route with the platform
 Bearer key. It accepts a nonnegative integer `remaining_calls` as the prepaid call balance and
 records the key's reported concurrency limit as an informational note. The policy is
-`requests / manual / api`; the 25 concurrent requests observed on the configured key are not
+`requests / manual / api`; the reported concurrency limit (`_CONCURRENCY`) is not
 a per-second rate, so no token-bucket rate is inferred. The status route stays out of the catalog.
 
 Fetchin capacity is `credits / manual / api`. `collectors._fetchinio` calls the free internal
@@ -364,7 +383,10 @@ quota gate. BYOK calls bypass it.
   `exhausted` until `resets_at`, or until the next sweep can prove otherwise.
 - **`sweep.py`** — `run_sweep(db)`: import policies → collect all providers in parallel (DB idle
   while the network is in flight) → one `CapacitySnapshot` per provider → publish each
-  `LatestState` to ratestore as `capacity:state:<provider>` (24 h TTL) → one commit. A note that
+  `LatestState` to ratestore as `capacity:state:<provider>` (24 h TTL) → one commit. The key is
+  the account's Settings slot spelling (`fiber_ai`); `state_key()` maps a catalog id (`fiber-ai`)
+  onto it through `platform_setting_name`, so the view and `clear_sweep_state` read the published
+  state under either spelling. A note that
   looks like a credential is withheld before it is stored. It never touches the call path's locks
   (`capacity:lock:*`): the meter it reads may not be the allowance that ran out.
 - **`marks.py`** - the call-path breaker, its own namespace `capacity:lock:<key>`; key = provider
@@ -623,8 +645,54 @@ after the DB phase ended and around the relay (`application/call/service.py`, pl
 The place is held until the answer is read (metered and owned-poll bodies), released in the relay
 block's `finally` on every path. A streamed free answer releases when the relay block ends, before
 the stream finishes. A wait shows in `X-Treg-Smoothed` as `share_wait=<ms>`. Own keys are never
-gated (non-negotiable 1). The counters are per process: exact for one server process; a
-multi-process deploy moves them to the shared store (`infra/kv.py`).
+gated (non-negotiable 1).
+
+The line and the fewest-first choice are per process; the cap is per account across every process.
+With `TREG_KV_URL` set every call queues, and each process asks the shared store for places on the
+account's behalf (`infra/provider_concurrency.py`: one Redis sorted set per account,
+`treg:provider-concurrency:v1:` plus the account key, on the same lease scripts as org concurrency),
+as many requests at once as it has free places and waiting calls, so free places fill in one round
+trip. Each place that lands goes to the waiting call rule 2 picks at that moment, so fewest-first
+holds for shared places too. Once the store says the account is full, the process asks one request
+at a time with backoff until a place lands; a call still waiting at
+`fair_share_wait_s` leaves as `share_busy`. A place that lands after its call left, or a reply that
+arrives after the lease could have expired, goes straight back and is never handed out. A lease
+lasts 30 s and is renewed every 10 s while the call runs, so a crashed process frees its places
+within one lease; expiry cannot stop a request already sent. When the store fails the dispatcher
+hands places out on this process's count and skips the store for 5 s; without `TREG_KV_URL` each
+process enforces the cap on its own, which is exact for one process. `share_wait` appears only for
+a call that met a full provider. Choosing an account (`keyslots`) still reads only this process's
+places.
+
+## Protect, part four - a shared rate window, observed before it refuses
+
+The smoother (D′) is per process and never refuses, so demand above a declared rate still reaches
+the provider and is answered 429, and every further process adds its own allowance. The shared
+window is the gate that would hold the declared rate across processes; it runs in observe mode
+first, so the declared numbers are checked against what providers actually serve before any call
+is refused on them.
+
+`TREG_PROVIDER_RATE_MODE` = `off` (default) | `observe`, with `TREG_KV_URL` set. In `observe`, a
+platform call about to go upstream (not an archive hit, never an own key) asks
+`infra/provider_rate.admit` about its smoothing bucket (`view.rate_bucket`: the provider, an
+endpoint with its own allowance, each further treg-owned account). The window is one sorted set
+per bucket, `treg:provider-rate:v1:` plus the bucket key, on the slot script org concurrency
+uses: an admitted call is a member that expires `window_s` later by the store's clock, and the
+window is full at `limit` live members. A call the window would refuse adds no member, so the
+admitted count is what the provider would see under enforcement. A store fault or a reply slower
+than 200 ms is an `unknown` verdict. The call is relayed unchanged whatever the verdict; the
+smoother's wait and the one `retry-after` re-send (not observed) still apply.
+When an org/endpoint quota admission is pending, it runs before the rate observation: a quota
+refusal neither asks the shared rate window nor records a provider attempt without an answer.
+
+`domain/capacity/rate_observe.py` counts each verdict (`admit`, `over`, `unknown`) against the
+provider's status (`2xx`, `429`, `other`, `none` when the relay raised) and emits one `capacity`
+line `rate_observe` per bucket and process at most once a minute, on that bucket's next call, with
+`provider`, `bucket`, `limit`, `window_s`, `observed_s` and the nonzero cells (`over_2xx`,
+`admit_429`, ...). A quiet bucket's last counts wait for its next call; process exit loses them.
+Sum the lines across processes over the same period. `over_2xx` is what enforcing the declared
+rate would cost (calls the provider served that the gate would have refused); `admit_429` is
+allowance the declared rate overstates.
 
 ## Overflow, the child cycle (step E) — off by default
 

@@ -24,6 +24,18 @@ sources:
   - src/treg/domain/identity/access.py
   - src/treg/domain/identity/api_keys.py
   - src/treg/domain/identity/session.py
+  - src/treg/application/enterprise_sso.py
+  - src/treg/alembic/versions/0079_enterprise_sso.py
+  - src/treg/alembic/versions/0080_enterprise_sso_audit.py
+  - src/treg/alembic/versions/0081_sso_manual_block.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
+  - src/treg/alembic/versions/0083_enterprise_sso_safety.py
+  - src/treg/alembic/versions/0084_enterprise_workos_cleanup.py
+  - src/treg/alembic/versions/0085_enterprise_sso_blocks.py
+  - src/treg/worker.py
+  - src/treg/routers/enterprise_sso.py
+  - src/treg/infra/workos.py
+  - tests/test_enterprise_sso.py
   - src/treg/domain/identity/promotions.py
   - tests/test_team_limit.py
   - tests/test_auth.py
@@ -49,6 +61,61 @@ related:
 ---
 
 # Multi-tenancy (orgs)
+
+## Enterprise SSO
+
+A team owner may purchase an enterprise SSO subscription, then open a short-lived WorkOS Admin
+Portal link from the team dashboard. WorkOS handles the customer's SAML or OIDC connection; treg
+keeps its own `User`, `Membership`, roles, sessions, and API keys. A successful WorkOS code exchange
+is accepted only when the returned organization matches this team's stored WorkOS organization and
+its connection is the same one previously used. A new human joins the existing team as `member`;
+an owner changes roles through the normal Members controls. Email domain alone never grants access.
+Email discovery checks WorkOS verified organization domains and routes to matching paid team links;
+if several teams match, the employee chooses one. It accepts a `past_due` team while Stripe retries.
+The exact team link bypasses discovery. Neither route grants membership until the state-checked
+WorkOS callback verifies the person and their organization.
+
+The owner may require SSO after one successful test sign-in. `require_member` then requires a signed
+browser session carrying this team ID for non-owners. An SSO browser session or derived CLI identity
+token can access only that team, even when the user belongs to several. Regular email or social login still identifies
+the global user but does not open that team. The owner retains a regular-login recovery path. API
+keys are separate credentials, and a regular browser session cannot mint a new Default key for an
+enforced team. A WorkOS profile is linked by stable profile and IdP IDs, with account email checked
+on later sign-ins; email changes need explicit review rather than silent account reassignment. New
+accounts require an email matching a verified WorkOS organization domain and the organization's
+external ID must match the treg team. Outside-organization profiles are refused. An existing global
+account requires a concurrent normal treg session for the same verified user before first linking.
+CLI pairing and OAuth consent check SSO scope and enforcement at issuance. OAuth codes, refresh
+families, and access tokens retain the SSO team; exchange, refresh, and use recheck policy. An OAuth
+grant made before SSO enforcement cannot continue into the enforced team. Earlier non-owner
+bearer keys, including agent keys, stop authorizing this team after enforcement. New human or
+agent keys issued through an authorized team session carry issuance provenance and work until
+their membership or key is revoked. Employees can also issue an SSO-scoped CLI key after company
+sign-in; the owner retains recovery access.
+
+On the Directory Sync plan, signed WorkOS events maintain a roster of active directory users,
+including people who have not yet signed in. Once a directory is connected, SSO sign-in requires a
+matching active IdP user in that roster. Inactive/deleted users lose their team membership and keys;
+deleting the directory removes all linked non-owner memberships. Owner recovery remains available.
+WorkOS event IDs make redelivery harmless. The SSO-only plan does not promise automatic offboarding.
+Provisioning never maps external groups into treg roles. A worker can reconcile the complete
+WorkOS roster to repair missed webhook deliveries. A manual team removal takes precedence over
+active directory records until the owner restores access. Durable, minimal `EnterpriseSSOAudit`
+rows record SSO sign-ins and failures, setup actions, role changes, enforcement switches, directory
+removals, manual team removals, and owner restores. Access changes and their audit rows commit together; setup actions are recorded after
+WorkOS responds. A retention worker deletes expired rows under the deployment's chosen policy.
+Full-roster repair recognizes WorkOS directories in the `linked` state and can discover one if its
+activation webhook was missed. It ignores other directory states so a disconnected directory cannot
+authorize employees. The repair also removes pre-sync SSO identities absent from the roster. Only
+`active` directory users count as
+provisioned. SSO and Directory Sync stay active while Stripe retries a `past_due` subscription.
+When the subscription ends, enforcement is lifted so existing members can use normal sign-in.
+Cancellation removes only SSO-created memberships; pre-existing members remain.
+The cleanup worker then deletes the canceled team's WorkOS directory and connection, clears
+obsolete SSO identity links, and records completion before a new checkout can start.
+`EnterpriseSSOBlock` retains only team and treg user IDs plus a timestamp for an explicit admin
+removal. `finish_signin` checks it across replacement WorkOS connections; restoration, team
+deletion, and global user erasure remove it.
 
 The registry is **tenant-isolated**: an **Org** owns resources, a **User** is a global identity, and a
 **Membership** links them with a role and IS where the caller's token lives. A token = a `(user, org)`
@@ -145,11 +212,12 @@ Org existence and coordinate with deletion before cleanup starts. See [configura
   another org, 403 when the role gate fails. **`_require_can_register`** gates create (secrets/tools/
   skills/oauth): a **viewer** (rank below member) may `call` + list only, and gets 403 on any register.
   `ROLE_RANK` orders owner > admin > member > viewer.
-- **Per-member tool ACL (the release feature).** `_require_tool_access(caller, tool.name)` gates **all**
-  use of a tool — the proxy `call_tool`, the server `run_tool_server`, AND the local `grant_local_run`:
+- **Per-member tool ACL (the release feature).** `_require_tool_access(caller, tool.name)` gates
+  the proxy `call_tool` and the local `grant_local_run`:
   allowed if the member's `tool_access` is NULL (all) or names the tool; the **owner is exempt**
   (`_tool_allowed`), admins + members can be restricted. `_require_local_run(caller)` additionally gates the
-  LOCAL tier on `local_run_enabled` (off → server runs only). Set via `set_member_access`
+  local tier on `local_run_enabled`. Server-side CLI execution is disabled for every caller, including
+  owners; `run_tool_server` always returns 503. Access is set via `set_member_access`
   (`PATCH /orgs/{id}/members/{user}/access`, admin+; an owner can't be restricted): `_normalize_tool_access`
   validates the names against the org's tools (422 on unknown) and **collapses an all-tools selection back
   to NULL** so a fully-checked member keeps auto-getting new tools. It's an **explicit allow-list**: a
@@ -293,7 +361,8 @@ Org existence and coordinate with deletion before cleanup starts. See [configura
   (`CLAUDECODE` → `claude-code`, `CODEX_*`, `CURSOR_*`, …; `TREG_CLIENT` overrides) and sends
   `X-Treg-Client`; `_client_of` normalizes it (slug ≤32, versions stripped, unknown-but-well-formed
   kept so a new runtime needs no release) onto `CallRecord.client` / `RunRecord.client` at all three
-  audit points. The endpoint aggregates 30 days into one row per (member, runtime), excluding
+  audit points. The endpoint aggregates 30 days (calls from the daily usage rollup,
+  [data-model](data-model.md)) into one row per (member, runtime), excluding
   `''`/`cli` (a roster listing every human twice teaches nothing) and machine identities (already
   attributed to themselves). **Attribution, never authentication** — anything holding the token can
   claim any name, so nothing gates on it; scoping a detected agent for real = minting it a token

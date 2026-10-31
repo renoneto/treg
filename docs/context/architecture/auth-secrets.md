@@ -284,6 +284,26 @@ hit it live). Now the method rides in the blob and `refresh()` honors it; a lega
 field gets body auth, then ONE retry with Basic on a 4xx, and stamps whichever worked — existing
 broken connections self-heal on their next call, no migration.
 
+The blob also snapshots `client_secret` and `token_uri`, and a team member can rewrite the blob. So
+for treg's own apps `ensure_fresh` does not trust either: when the `Secret` row's `provider` is a
+registry provider and the blob's `client_id` is the one this deployment configures for that provider
+profile, `oauth_providers.platform_refresh_blob` substitutes the current env secret **and** the
+profile's own `token_uri`, and neither is written back (the stored blob keeps its own values). Any other
+blob, including one that merely names treg's `client_id`, refreshes with only what it stores. Rotating a
+treg app secret is therefore an env change plus a deploy on every service that refreshes; the old
+secret can be deleted at the provider as soon as that deploy is live.
+
+**Meta App Secret Proof.** treg's Meta app requires App Secret Proof, so Graph refuses any server
+call whose user or Page token is not paired with `appsecret_proof` = HMAC-SHA256(app secret, token)
+(400, code 100). Profiles that ride that app declare `appsecret_proof=True` (`facebook`, `meta-ads`,
+Instagram's `facebook-page`), and `oauth_providers.appsecret_proof` computes one only when the
+token's blob names the `client_id` this deployment configures for that profile and the request goes
+to the profile's own API or discovery host. Every request that sends such a token carries it: the
+relay and the health probe (`connection_appsecret_proof`, over the token the binding injects, so a
+Page call is proved with the Page token) and the account picker, Page-token lookup and resource
+setup in `application/connect.py`. Token exchange and refresh send the app secret itself and need no
+proof. A team's own Meta app never gets one computed with treg's secret.
+
 **Connect flow (mint the first token):** `consent_url(pending)` builds the provider consent URL
 (default `access_type=offline` + `prompt=consent` so a refresh token comes back); `exchange_code(pending,
 code, client)` trades the auth code for tokens and returns a self-refreshable blob. Both honor
@@ -486,6 +506,9 @@ module symbols:
   examples (marker `stamped: resource`, so re-picking replaces instead of piling up).
 - Post-connect helpers the dashboard/CLI drive: resource **discovery** (`supports_discovery`,
   `discover_*` — which site/property/account this connection acts on), row **enrichment**.
+  `list_connection_resources` turns YouTube's `quotaExceeded` discovery response into the stable
+  `youtube_quota_exceeded` error code, so the channel picker can explain the temporary limit without
+  showing Google's raw error text.
   Discovery can walk a SECOND listing (`discover_extra_path` + `discover_extra_list_paths`): Meta's
   Business Manager owns assets on the user's behalf, so an agency member sees `[]` from
   `/me/accounts` for exactly the Pages/Instagram accounts they manage all day — the Business walk

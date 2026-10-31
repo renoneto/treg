@@ -15,13 +15,15 @@ hook, an optional voiced demo clip, and `bill.md` with what each step cost.
 ## Prerequisites
 
 - **treg.** Every catalog call, upload and poll goes through treg; the vendor keys stay server-side
-  and the charge lands on the team's prepaid balance. If `treg --version` fails:
+  and the charge lands on the team's prepaid balance. This skill needs the `treg` CLI even when
+  treg's MCP tools are connected, because `treg host` uploads the local reference frames. If
+  `treg --version` fails, give the human these commands and run them only if they asked you to:
   ```bash
   curl -fsSL https://treg.to/install.sh | sh
   treg login
   ```
-  `treg balance` before starting. A full run of 4 hook clips lands in the low single-digit dollars
-  at 720p; say the estimate before each paid step.
+  `treg balance` before starting. A full run of 4 hook clips of 12-18 s costs about $13-20 at
+  720p ($0.27 a second); say the estimate before each paid step.
 - **Two sibling skills** this one delegates to. Read each before its step, do not paraphrase them:
   - `portrait-clone` (the character): https://raw.githubusercontent.com/agentara/skills/refs/heads/main/skills/aigc/portrait-clone/SKILL.md
   - `ugc-talking-head-video` (the clips and captions): https://raw.githubusercontent.com/superdesigndev/treg/main/.agents/skills/ugc-talking-head-video/SKILL.md

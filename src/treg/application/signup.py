@@ -1,6 +1,9 @@
 """Identity provisioning and first-team creation use cases."""
 
 import logging
+import re
+import secrets
+import time
 from datetime import timedelta
 from urllib.parse import quote, unquote
 
@@ -9,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from .. import adsconv, analytics, health, policy, sandbox as demo_sandbox
+from .. import adsconv, analytics, crypto, health, policy, ratestore, sandbox as demo_sandbox
 from ..config import get_settings
 from ..domain import money as ledger
 from ..domain import referrals
@@ -46,6 +49,10 @@ class BlockedEmailError(Exception):
     """An address on a blocked email domain reached an identity door."""
 
 
+class UnverifiedExistingUserError(Exception):
+    """SSO cannot attach a verified assertion to an unverified existing account."""
+
+
 def blocked_email(email: str, door: str) -> bool:
     """The blocklist DECISION for the identity doors, over the pure classifier `_is_blocked_email`:
     True means refuse. One structured line per block, so a burst of refusals is countable from the
@@ -66,7 +73,7 @@ def blocked_email(email: str, door: str) -> bool:
 async def find_or_create_user(
     db: AsyncSession, email: str, *, door: str = "login",
     created: set[int] | None = None, verified: bool = False, promo_eligible: bool = True,
-    proven: set[int] | None = None,
+    proven: set[int] | None = None, reject_unverified_existing: bool = False,
 ) -> User:
     """Find a user by email, else register them — the user ONLY, **no auto personal org**. The shared
     core of every identity door (GitHub / Google / email OTP). A brand-new user therefore lands with
@@ -75,7 +82,8 @@ async def find_or_create_user(
     token is user-scoped, so it works before they have any org (org chosen per-request via X-Treg-Org).
     Only trusted email-proof callers pass verified=True; `proven` collects a user this call verified
     for the first time (see `grant_signup_promo_on_proof`). promo_eligible=False creates the user
-    without a signup-credit claim; it never touches an existing user. Caller commits."""
+    without a signup-credit claim; it never touches an existing user. SSO can refuse to link an
+    existing account that has not proved its email. Caller commits."""
     email = _norm_email(email)
     # Machine identities (agents, the published demo token) are minted by an admin and act ONLY by
     # their token. This is the single choke point every identity door shares, so blocking here means
@@ -96,9 +104,13 @@ async def find_or_create_user(
         except IntegrityError:
             await db.rollback()  # another worker just created this same new user — reuse theirs
             user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+            if reject_unverified_existing and user.email_verified_at is None:
+                raise UnverifiedExistingUserError from None
         else:
             if created is not None:
                 created.add(user.id)
+    elif reject_unverified_existing and user.email_verified_at is None:
+        raise UnverifiedExistingUserError
     if verified and user.email_verified_at is None:
         # Conditional, so of two proofs racing for one unverified user only the one that flips the
         # column is the first proof; the other sees no row and is an ordinary sign-in.
@@ -209,6 +221,51 @@ def _ad_attribution_from(raw_cookie: str) -> tuple[str, str, str]:
         # Old cookies were `CLICK_ID|landing` and always held a GCLID.
         click_field, click_id, landing = "gclid", first, rest
     return click_field, click_id.strip()[:255], landing.strip()[:64]
+
+
+# The short install link (`architecture/ads-conversions.md`, "Capture"): a code the copied command
+# carries in place of the cookie an agent's own browser never held.
+AD_LINK_NS = "ad_link"
+AD_LINK_TTL = timedelta(days=30)
+AD_LINK_RE = re.compile(r"[a-z0-9]{6}")
+AD_LINK_PER_ADDRESS = (30, 600.0)  # codes per client address per window (seconds)
+_AD_LINK_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # no 0/o/1/l/i: a human may retype it
+
+
+async def mint_ad_link(raw_cookie: str, *, address: str) -> str | None:
+    """A fresh code bound to the click in `raw_cookie`, or None when there is no usable click.
+    Raises `SignupError("too_many_links")` past the per-address limit."""
+    kind, click_id, landing = _ad_attribution_from(raw_cookie)
+    if not click_id:
+        return None
+    code = "".join(secrets.choice(_AD_LINK_ALPHABET) for _ in range(6))
+    per_address, window_s = AD_LINK_PER_ADDRESS
+    async with session_maker() as db:
+        if not await ratestore.rate_check(db, "ad_link_ip", [(address, per_address)], window_s):
+            await db.rollback()
+            raise SignupError("too_many_links")
+        await ratestore.sweep(db, AD_LINK_NS)
+        await ratestore.kv_put(db, AD_LINK_NS, crypto.hash_token(code),
+                               {"cookie": quote(f"{kind}|{click_id}|{landing}", safe=""),
+                                "minted_at": time.time()},
+                               ttl_s=AD_LINK_TTL.total_seconds())
+        await db.commit()
+    return code
+
+
+async def redeem_ad_link(code: str) -> tuple[str, int]:
+    """(cookie value, seconds it may still live) for a code, or ("", 0) for an unknown, expired,
+    already redeemed or malformed code. A code redeems once."""
+    if not code or not AD_LINK_RE.fullmatch(code) or not adsconv.enabled():
+        return "", 0
+    async with session_maker() as db:
+        row = await ratestore.kv_take(db, AD_LINK_NS, crypto.hash_token(code))
+        await db.commit()
+    cookie = str((row or {}).get("cookie") or "")
+    max_age = int(float((row or {}).get("minted_at") or 0) + AD_CLICK_STASH_TTL.total_seconds() - time.time())
+    if not cookie or max_age <= 0:
+        return "", 0
+    return cookie, max_age
 
 
 async def stash_ad_click(email: str, raw_cookie: str) -> None:

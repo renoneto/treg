@@ -20,11 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from ..timeutil import utcnow_naive as _utcnow_naive
-from .. import adsconv, agent_pages, oauth_providers
+from .. import adsconv, agent_pages, client_ip, oauth_providers
 from ..domain import referrals
 from ..domain.catalog import store as catalog_store
 from ..domain.identity import session as sess
 from ..config import PUBLIC_HOST_ALIASES, get_settings
+from ..application import signup as signup_use_cases
 from ..infra.db import get_session
 from ..models import User
 from ..domain.catalog import stats as endpoint_stats
@@ -32,7 +33,7 @@ from .catalog import (_endpoint_observation_reader, _observed_or_empty, _platfor
                       _provider_display, catalog_platform,
                       _platforms_payload)
 from ..domain.identity.access import _user_from_session
-from .auth_helpers import OAUTH_RETURN_COOKIE, _is_https, _take_oauth_return
+from .auth_helpers import OAUTH_RETURN_COOKIE, _is_https, _same_origin, _take_oauth_return
 from .signup_cookies import _remember_referral
 
 
@@ -194,7 +195,7 @@ def _page(title: str, description: str, path: str, body: str, ld: list[dict],
     # The job, workflow and agent pages exist on the hosted deployment only (`_hosted`): a
     # self-hosted registry must not put three 404s in its own footer.
     hub_links = ('<a href="/use-cases">Use cases</a><a href="/workflows">Workflows</a>'
-                 '<a href="/gtm-engineering">GTM engineering</a><a href="/showcase">Showcase</a>'
+                 '<a href="/gtm-engineering">GTM engineering</a><a href="/showcase">Showcase</a><a href="/rankings">Rankings</a>'
                  '<a href="/agents">Agents</a><a href="/blog">Blog</a>' if _hosted() else "")
     return HTMLResponse(f"""<!doctype html>
 <html lang="en">
@@ -3219,14 +3220,18 @@ async def landing(request: Request, treg_session: str = Cookie(default=""),
                   db: AsyncSession = Depends(get_session)):
     """Serve the homepage with session-aware entry points.
 
-    Query links go to the SPA, except a referral code (plus any utm_* tags) retained for signup.
+    Query links go to the SPA, except referral links and SSO sign-in results, which use
+    controls on the landing page.
     """
     page = _WEB_DIR / "landing.html"
     ref = referrals.normalize_code(request.query_params.get("ref", ""))
     # An influencer's short link appends utm_* to the ref; those must not push it to the SPA, which
     # never parks the code.
     ref_only = all(k == "ref" or k.startswith("utm_") for k in request.query_params.keys())
-    if page.exists() and (not request.query_params or (ref and ref_only)):
+    sso_error = request.query_params.get("sso_error", "")
+    sso_result = (sso_error in {"domain", "failed", "expired", "link"} and
+                  set(request.query_params.keys()) <= {"sso_error", "team"})
+    if page.exists() and (not request.query_params or (ref and ref_only) or sso_result):
         signed_in = bool(treg_session and await _user_from_session(treg_session, db))
         # The email-code door signs in on the page that opened it and reloads there, and the
         # OAuth sign-in modal opens on `/`, so a parked authorization must resume here as well.
@@ -3419,6 +3424,7 @@ _SITEMAP_PAGES: tuple[tuple[str, str, str], ...] = (
     ("/blog", "", "0.7"),
     ("/blog/work-email-finding-bench", "", "0.6"),
     ("/blog/people-search-bench", "", "0.6"),
+    ("/blog/security-incident-2026-10-23", "", "0.6"),
     ("/vendor-listing", "vendor-listing.md", "0.5"),
     ("/support", "support.html", "0.4"),
     ("/connectors/claude", "claude-connector.html", "0.6"),
@@ -3432,6 +3438,8 @@ _SITEMAP_PAGES: tuple[tuple[str, str, str], ...] = (
     ("/gpt6", "astra.html", "0.8"),
     ("/ugc", "ugc.html", "0.8"),
     ("/aeo", "aeo.html", "0.8"),
+    ("/rankings", "rankings.html", "0.8"),
+    ("/rea-growth", "rea-growth.html", "0.8"),
     ("/jev", "jev.html", "0.8"),
     ("/terms", "terms.html", "0.2"),
     ("/privacy", "privacy.html", "0.2"),
@@ -3534,16 +3542,51 @@ async def indexnow_key():
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-@app.get("/install.sh", include_in_schema=False)
-async def install_sh():
-    """`curl -fsSL {BASE}/install.sh | sh` — installs the treg CLI and points it at this server.
-    The serving domain is templated in so it targets whichever host is live (dev box or the real
-    domain after deploy)."""
+def _install_script(ad_link: str = "") -> PlainTextResponse:
+    """The install script with the serving domain templated in, so it targets whichever host is
+    live (dev box or the real domain after deploy), and the short-link code when fetched as
+    `/i/<code>` (empty on the plain URL)."""
     f = _WEB_DIR / "install.sh"
     if not f.exists():
         raise HTTPException(status_code=404, detail="install.sh not bundled")
     base = get_settings().public_url.rstrip("/")
-    return PlainTextResponse(f.read_text(encoding="utf-8").replace("{BASE}", base), media_type="text/x-shellscript; charset=utf-8")
+    text = f.read_text(encoding="utf-8").replace("{BASE}", base).replace("{AD_LINK}", ad_link)
+    return PlainTextResponse(text, media_type="text/x-shellscript; charset=utf-8")
+
+
+@app.get("/install.sh", include_in_schema=False)
+async def install_sh():
+    """`curl -fsSL {BASE}/install.sh | sh` — installs the treg CLI and points it at this server."""
+    return _install_script()
+
+
+@app.get("/i/{code}", include_in_schema=False)
+async def install_sh_linked(code: str):
+    """`curl -fsSL {BASE}/i/<code> | sh` — the install script the ad landing page hands out, with the
+    code the script leaves for `treg login` (see `signup.mint_ad_link`). Any well-formed code is
+    served: an unknown one installs exactly like `/install.sh`, and the sign-in simply restores
+    nothing, so a stale link never breaks an install."""
+    if not signup_use_cases.AD_LINK_RE.fullmatch(code):
+        raise HTTPException(status_code=404)
+    return _install_script(code)
+
+
+@app.post("/i", include_in_schema=False)
+async def ad_link_mint(request: Request) -> dict:
+    """The landing page asks for a code when the visitor's browser holds an ad click (`treg_ad`).
+    `{"code": null}` when there is no click or capture is off, so the page keeps the plain command."""
+    if not _same_origin(request):
+        raise HTTPException(status_code=403, detail="cross-origin mint rejected")
+    raw = request.cookies.get("treg_ad") or ""
+    if not raw or not adsconv.enabled():
+        return {"code": None}
+    try:
+        code = await signup_use_cases.mint_ad_link(raw, address=client_ip.of(request))
+    except signup_use_cases.SignupError as exc:
+        if exc.kind != "too_many_links":
+            raise
+        raise HTTPException(status_code=429, detail="too many install links; try again in a few minutes") from exc
+    return {"code": code}
 
 
 @app.get("/selfhost.sh", include_in_schema=False)
@@ -3710,6 +3753,14 @@ async def jev_memory_skill_md():
     lasting preferences are remembered. Opt-in: kept out of the well-known index, so
     `treg skill bootstrap` (install.sh) never installs it unasked."""
     return _serve_md("skills/jev-memory/SKILL.md")
+
+
+@app.get("/skills/rea-growth/SKILL.md", include_in_schema=False)
+async def rea_growth_skill_md():
+    """The rea-growth skill: the /rea-growth flow (a company's growth moves, its content per channel,
+    the plays to copy) as a file an agent can follow. Opt-in like jev-memory: kept out of the
+    well-known index, so `treg skill bootstrap` (install.sh) never installs it unasked."""
+    return _serve_md("skills/rea-growth/SKILL.md")
 
 
 @app.get("/feedback.md", include_in_schema=False)
@@ -3928,6 +3979,25 @@ async def aeo_page(request: Request):
     return _static_page("aeo.html", request)
 
 
+@app.get("/rea-growth", include_in_schema=False)
+async def rea_growth_page(request: Request):
+    """REA for growth: reverse engineer how a company grows. The agent walks the target's path
+    from first touch to sharing through treg (traffic, search, ads, posts, pages, links, job
+    openings) and returns plays marked seen or inferred, each with the ask that runs it. Served
+    like /aeo: canonical, in the sitemap, no-cache, relative asset paths."""
+    return _static_page("rea-growth.html", request)
+
+
+@app.get("/rea-growth.md", include_in_schema=False)
+async def rea_growth_md():
+    """The full Lovable report behind /rea-growth as Markdown: what the page's "Copy the playbook"
+    button copies, and what agents read instead of the rendered page. `noindex`: the HTML page is
+    the indexed copy."""
+    resp = _serve_md("rea-growth.md")
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
+
+
 @app.get("/showcase", include_in_schema=False)
 async def showcase_page(request: Request):
     """The gallery of products built on treg: each app, its maker and the maker's launch post,
@@ -4091,6 +4161,8 @@ async def jev_xboost_judge(request: Request, db: AsyncSession = Depends(get_sess
 # chronological (newest first), not alphabetical.
 _BLOG_LAUNCHES: list[tuple[str, str, str, str]] = [
     # (slug, title, date, one-line blurb)
+    ("/rea-growth", "REA for Growth", "2026-10-29",
+     "Name a company; your agent takes its distribution apart and hands you plays to copy."),
     ("/aeo", "How to Get AI to Recommend Your Product", "2026-10-17",
      "Four steps and one prompt: what customers ask, who AI recommends, the sites it cites, getting on them."),
     ("/recruit", "OpenSource LinkedIn Recruiter", "2026-10-17",
@@ -4121,6 +4193,8 @@ _BLOG_LAUNCHES: list[tuple[str, str, str, str]] = [
 # have their own top-level routes), but they sit prominently on the /blog index above launches.
 _BLOG_POSTS: list[tuple[str, str, str, str]] = [
     # (slug under /blog/, title, date, one-line blurb)
+    ("security-incident-2026-10-23", "23 Oct 2026 Treg security incident report", "2026-10-25",
+     "What happened, what may be affected, and what to rotate. Investigation ongoing."),
     ("work-email-finding-bench", "Work Email Finding: a 292 Person Receipt", "2026-09-16",
      "Quality tie across vendors. Cost is the gap: $0.0056 vs $0.0395 per correct."),
     ("people-search-bench", "#1 on People Search Bench", "2026-09-14",
@@ -4249,6 +4323,27 @@ async def blog_people_search_bench():
                  "treg.to scores 80.0% on recruiting, 78.2% on B2B prospecting on People Search Bench "
                  "by LessieAI. 119 real tasks, same agent with and without the plugin.",
                  "/blog/people-search-bench", body, ld)
+
+
+@app.get("/blog/security-incident-2026-10-23", include_in_schema=False)
+async def blog_security_incident_2026_10_23():
+    """Customer-facing incident report. The body lives in its own HTML file so the report can be
+    updated without touching route code."""
+    if not _hosted():
+        raise HTTPException(status_code=404, detail="not found")
+    base = get_settings().public_url.rstrip("/")
+    slug = "security-incident-2026-10-23"
+    title = next(p[1] for p in _BLOG_POSTS if p[0] == slug)
+    body = (_WEB_DIR / f"blog-{slug}.html").read_text(encoding="utf-8")
+    ld = [_blog_posting_ld(slug, base),
+          {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+        {"@type": "ListItem", "position": 1, "name": "treg.to", "item": base + "/"},
+        {"@type": "ListItem", "position": 2, "name": "Blog", "item": base + "/blog"},
+        {"@type": "ListItem", "position": 3, "name": title, "item": f"{base}/blog/{slug}"}]}]
+    return _page(f"{title} | treg.to",
+                 "On October 23, 2026 we confirmed unauthorized access to part of treg's production "
+                 "systems. What may be affected, what we have done, and what you need to do.",
+                 f"/blog/{slug}", body, ld)
 
 
 @app.get("/blog/work-email-finding-bench", include_in_schema=False)

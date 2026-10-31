@@ -16,6 +16,9 @@ the user, and it asks for authority the capability doesn't need.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
@@ -181,6 +184,10 @@ class OAuthProvider:
     # Instagram Login uses a different long-lived exchange and a renewable 60-day access token.
     # Empty keeps the standard provider behavior; "instagram" snapshots that protocol on PendingOAuth.
     long_lived_exchange_style: str = ""
+    # Meta apps with "Require App Secret" refuse every server call whose token is not paired with
+    # `appsecret_proof` = HMAC-SHA256(app secret, token). Declared on the profiles that ride treg's
+    # Meta app; `appsecret_proof()` below decides when one is owed.
+    appsecret_proof: bool = False
     # One logical catalog provider can expose explicit, separate grants. Each method selects a
     # protocol profile without changing the provider id or duplicating its endpoint catalog.
     authorization_methods: tuple[OAuthAuthorizationMethod, ...] = ()
@@ -973,6 +980,7 @@ FACEBOOK = OAuthProvider(
     },
     client_id_setting="meta_client_id",
     client_secret_setting="meta_client_secret",
+    appsecret_proof=True,
     category="Social media",
     summary=(
         "Your Pages' posts, comments and reach — and publishing to them."
@@ -1127,6 +1135,7 @@ INSTAGRAM = OAuthProvider(
                 ("auth_uri", _META_AUTH), ("token_uri", _META_TOKEN),
                 ("client_id_setting", "meta_client_id"),
                 ("client_secret_setting", "meta_client_secret"),
+                ("appsecret_proof", True),
                 ("base_url", _META_BASE),
                 ("docs_url", "https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-facebook-login"),
                 ("consent_notice", _META_CONSENT_NOTICE), ("auth_params", {}),
@@ -1188,6 +1197,7 @@ META_ADS = OAuthProvider(
     },
     client_id_setting="meta_client_id",
     client_secret_setting="meta_client_secret",
+    appsecret_proof=True,
     category="Advertising",
     summary=(
         "Ad accounts, campaigns and performance across Facebook and Instagram, with full campaign management."
@@ -1322,6 +1332,33 @@ HUNTER = OAuthProvider(
     base_url="https://api.hunter.io/v2",
     docs_url="https://hunter.io/api-documentation/v2",
     probe_path="/account",  # free — consumes no search/verification/enrichment credits
+)
+
+MOBIUSENGINE_JOBS = OAuthProvider(
+    service="mobiusengine-jobs",
+    display_name="MobiusEngine Jobs Data",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your MobiusEngine Jobs Data API key",
+    # The key rides in x-api-key (Authorization: Bearer is accepted too); the header keeps it out of logged URLs.
+    token_header="x-api-key",
+    token_format="{secret}",
+    setup_url="https://jobs.arihaan.ai/pay-per-job",
+    setup_action_label="Get your MobiusEngine Jobs Data API key",
+    setup_steps=(
+        "Open the pay-per-job page and sign in with Google. New accounts start with a $1 credit.",
+        "Copy the API key shown on your first sign-in (it is shown once; more can be made under API keys).",
+        "Add funds under Pay per job when the credit is used: calls are charged per job from that balance.",
+    ),
+    setup_note="Billed per job from a prepaid balance. The balance, usage, meta and rates routes are free.",
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Jobs data",
+    summary="Search and fetch live job postings from employers' own career sites, with or without the full description.",
+    base_url="https://jobs-api.arihaan.ai",
+    docs_url="https://jobs.arihaan.ai/docs",
+    probe_path="/v1/balance",  # free; a bad or missing key gets HTTP 401 {"error": {"code": "unauthorized", ...}}
 )
 
 ANYAPI = OAuthProvider(
@@ -1726,6 +1763,26 @@ CONTACTOUT = OAuthProvider(
     base_url="https://api.contactout.com", docs_url="https://api.contactout.com/",
     probe_path="/v1/stats", token_ok_field="status_code", token_ok_value="200",
     # Garbage token returns HTTP 401; the supplied platform token returns 200.
+)
+
+ORBISEARCH = OAuthProvider(
+    service="orbisearch",
+    display_name="OrbiSearch",
+    auth_kind="key",
+    token_label="API key",
+    token_placeholder="your OrbiSearch API key",
+    token_header="X-API-Key",
+    token_format="{secret}",
+    setup_url="https://orbisearch.com/dashboard/api-keys",
+    setup_action_label="Get your OrbiSearch API key",
+    setup_steps=("Sign in to OrbiSearch and copy an API key from the dashboard.",),
+    setup_note="A free credit-balance check verifies the key. Your own key is billed by OrbiSearch.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Verify email addresses, find work emails, and enrich companies.",
+    base_url="https://api.orbisearch.com",
+    docs_url="https://orbisearch.com/docs",
+    probe_path="/v1/credits",
 )
 
 MILLIONVERIFIER = OAuthProvider(
@@ -2499,6 +2556,22 @@ CRUSTDATA = OAuthProvider(
     probe_path="/account/credits",
 )
 
+THEIRSTACK = OAuthProvider(
+    service="theirstack", display_name="TheirStack", auth_kind="key",
+    token_label="API key", token_placeholder="your TheirStack API key",
+    setup_url="https://app.theirstack.com/",
+    setup_action_label="Get your TheirStack API key",
+    setup_steps=("Sign in to TheirStack and open your workspace settings.",
+                 "Create or copy an API key and paste it here."),
+    setup_note="Jobs and company data spend API credits. The balance check is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Search jobs and companies, inspect technologies and buying intent, and browse filter catalogs.",
+    base_url="https://api.theirstack.com",
+    docs_url="https://theirstack.com/en/docs/what-is-theirstack",
+    probe_path="/v0/billing/credit-balance",
+)
+
 
 AVIATO = OAuthProvider(
     service="aviato",
@@ -2772,6 +2845,23 @@ SERPER = OAuthProvider(
     probe_path="/account",
 )
 
+BRAVESEARCH = OAuthProvider(
+    service="bravesearch", display_name="Brave Search", auth_kind="key",
+    token_label="Search API key", token_placeholder="your Brave Search API key",
+    token_header="X-Subscription-Token", token_format="{secret}",
+    setup_url="https://api-dashboard.search.brave.com/app/keys",
+    setup_action_label="Get your Brave Search API key",
+    setup_steps=("Activate the Search plan in Brave's API dashboard.",
+                 "Create a Search API key and paste it here."),
+    setup_note="Brave has no key-readable balance endpoint. Connecting checks the key with one paid web search.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Research & public data",
+    summary="Search Brave's web, news, images, videos and places, and retrieve LLM context.",
+    base_url="https://api.search.brave.com/res",
+    docs_url="https://api-dashboard.search.brave.com/documentation",
+    probe_path="/v1/web/search?q=example.com&count=1",
+)
+
 LITESCRAPE = OAuthProvider(
     service="litescrape",
     display_name="Litescrape",
@@ -2908,6 +2998,10 @@ CRAWL4AI = OAuthProvider(
     base_url="https://api.crawl4ai.com",
     docs_url="https://api.crawl4ai.com/docs",
     probe_path="/v1/billing/balance",  # free: reads the credit balance, spends nothing
+    catalog_targets=(
+        # Lead (company and people search) answers from its own gate; the same key, same Bearer header.
+        CatalogTarget(host="gate.crawl4ai.com", base_url="https://gate.crawl4ai.com"),
+    ),
 )
 
 SPIDERCLOUD = OAuthProvider(
@@ -3357,6 +3451,58 @@ FINDYMAIL = OAuthProvider(
     token_verify_field="email",
 )
 
+ANYMAILFINDER = OAuthProvider(
+    service="anymailfinder", display_name="Anymail Finder", auth_kind="key",
+    token_label="API key", token_placeholder="your Anymail Finder API key",
+    token_header="Authorization", token_format="{secret}",
+    setup_url="https://app.anymailfinder.com/api",
+    setup_action_label="Get your Anymail Finder API key",
+    setup_steps=("Sign in to Anymail Finder and open the API page.",
+                 "Enable the API if needed, then copy the key."),
+    setup_note="Email searches and verification use credits; the account balance check is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find verified work emails by person, company or decision-maker role, and verify addresses.",
+    base_url="https://api.anymailfinder.com",
+    docs_url="https://anymailfinder.com/email-finder-api/docs",
+    probe_path="/v5.1/account", token_verify_field="email",
+)
+
+ENROW = OAuthProvider(
+    service="enrow", display_name="Enrow", auth_kind="key",
+    token_label="API key", token_placeholder="your Enrow API key",
+    token_header="x-api-key", token_format="{secret}",
+    setup_url="https://app.enrow.io/",
+    setup_action_label="Get your Enrow API key",
+    setup_steps=("Sign in to Enrow and open API Settings.", "Copy your API key."),
+    setup_note="Email and phone searches use credits; the account check is free.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find and verify professional emails and find phone numbers.",
+    base_url="https://api.enrow.io",
+    docs_url="https://docs.enrow.io/api-overview",
+    probe_path="/account/info",
+)
+
+
+DROPCONTACT = OAuthProvider(
+    service="dropcontact", display_name="Dropcontact", auth_kind="key",
+    token_label="API key", token_placeholder="your Dropcontact API key",
+    token_header="X-Access-Token", token_format="{secret}",
+    setup_url="https://app.dropcontact.com/",
+    setup_action_label="Get your Dropcontact API key",
+    setup_steps=("Sign in to Dropcontact and open Integrations & API.",
+                 "Copy your API key and paste it here."),
+    setup_note="Email and contact enrichment spend credits on verified results. Connection verification reads the balance without spending a credit.",
+    auth_uri="", token_uri="", scopes={}, client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary="Find and verify B2B work emails, enrich contacts and companies, and clean job titles.",
+    base_url="https://api.dropcontact.com",
+    docs_url="https://developer.dropcontact.com/",
+    probe_path="/v1/enrich/all", probe_method="POST", probe_json={"data": [{}]},
+    token_reject_field="error",
+)
+
 
 BRANDDEV = OAuthProvider(
     service="branddev",
@@ -3465,6 +3611,39 @@ LEADSFORGE = OAuthProvider(
     # "code":"invalid_api_key"} and a missing key 401 {"message":"missing api key"}. No
     # token_verify_field / probe_reject_statuses needed - the status alone is honest.
     probe_path="/balance",
+)
+
+
+VILLAGE = OAuthProvider(
+    service="village",
+    display_name="Village.ai",
+    auth_kind="key",
+    token_label="API token",
+    token_placeholder="your Village.ai API token",
+    token_header="Authorization",
+    token_format="Bearer {secret}",
+    setup_url="https://village.ai/settings#api-token",
+    setup_action_label="Get your Village.ai API token",
+    setup_steps=(
+        "Sign in to Village.ai and open Settings, then API Token.",
+        "Copy your personal API token. It acts as you, so keep it private.",
+    ),
+    setup_note=(
+        "Cached lookups are free, every account gets 100 credits a month with no credit card, and "
+        "email reveals are pay-on-success: no email found, no credit."
+    ),
+    auth_uri="", token_uri="",
+    scopes={},
+    client_id_setting="", client_secret_setting="",
+    category="Enrichment",
+    summary=(
+        "Find the warmest intro path through your team to any person or company. Free cached "
+        "people, company and reverse email enrichment for sales, recruiting, fundraising and job "
+        "search."
+    ),
+    base_url="https://api.village.ai",
+    docs_url="https://docs.village.ai/api-reference/introduction",
+    probe_path="/v2/user/me",  # free; a bad token gets HTTP 401 (verified live 2026-10-07)
 )
 
 
@@ -3998,9 +4177,9 @@ REGISTRY: dict[str, OAuthProvider] = {
         GOOGLE_ADS, YOUTUBE,
         LINKEDIN, SLACK, X, TIKTOK, FACEBOOK, INSTAGRAM, META_ADS,
         # API-key providers
-        ANYAPI, APOLLO, PDL, AKTA, HUNTER, SUMBLE, MOLTSETS, OPENMART, HARVESTAPI, FETCHINIO, SIXTYFOUR, BLITZAPI, DROPLEADS,
+        ANYAPI, APOLLO, PDL, AKTA, HUNTER, MOBIUSENGINE_JOBS, SUMBLE, MOLTSETS, OPENMART, HARVESTAPI, FETCHINIO, SIXTYFOUR, BLITZAPI, DROPLEADS,
         QUICKENRICH, PROSPEO, AIARK, WIZA, LIMADATA, GETLEADSIO, SCRUBBY, ZEROBOUNCE, DATAGMA,
-        TRYKITT, CONTACTOUT, MILLIONVERIFIER, BOUNCEBAN, CRUNCHBASE, MINIMAX, FISHAUDIO,
+        TRYKITT, CONTACTOUT, MILLIONVERIFIER, ORBISEARCH, BOUNCEBAN, CRUNCHBASE, MINIMAX, FISHAUDIO,
         OPENROUTER,
         REPLICATE,
         REAPI, PIAPI, GOOGLE_AI, TINYFISH,
@@ -4008,11 +4187,11 @@ REGISTRY: dict[str, OAuthProvider] = {
         SCRAPECREATORS,
         # SEO API-key providers
         DATAFORSEO, SERANKING, MOZ, MAJESTIC, SERPSTAT, EXA, SEARCH1API, TAVILY, OCTEN, LINKUP, PARALLEL, YOU, VALYU, KEENABLE, OLOSTEP, FIRECRAWL, CRAWL4AI, SPIDERCLOUD, PERPLEXITY,
-        SCRAPEGRAPHAI, SERPER, LITESCRAPE, CLORO,
+        SCRAPEGRAPHAI, SERPER, BRAVESEARCH, LITESCRAPE, CLORO,
         # more Enrichment API-key providers
-        LUSHA, CORESIGNAL, DIFFBOT, THECOMPANIESAPI, LEADMAGIC, ENRICHLAYER, FIBER_AI, CRUSTDATA, AVIATO,
-        COMPANYENRICH, OCEANIO, ADYNTEL, TOMBA, TRESTLEIQ, HLRLOOKUP, PREDICTLEADS, FINDYMAIL, BRANDDEV, ICYPEAS, LEADSFORGE,
-        INFLUENCERSCLUB,
+        LUSHA, CORESIGNAL, DIFFBOT, THECOMPANIESAPI, LEADMAGIC, ENRICHLAYER, FIBER_AI, CRUSTDATA, THEIRSTACK, AVIATO,
+        COMPANYENRICH, OCEANIO, ADYNTEL, TOMBA, TRESTLEIQ, HLRLOOKUP, PREDICTLEADS, FINDYMAIL, ANYMAILFINDER, ENROW, DROPCONTACT, BRANDDEV, ICYPEAS, LEADSFORGE,
+        INFLUENCERSCLUB, VILLAGE,
         # Market data API-key providers
         COINGECKO, POLYGON, FINNHUB, TWELVEDATA, FMP, EODHD, MARKETSTACK, TIINGO,
         FINANCIALDATASETS, VIGIL,
@@ -4027,7 +4206,7 @@ DEFAULT_CAPABILITY = "read"
 # Shelf order in the marketplace. Anything carrying a category not named here sorts last, so a
 # provider added without one is visible rather than lost between the shelves.
 CATEGORY_ORDER = ("AI generation", "SEO", "Advertising", "Social media", "Enrichment",
-                  "Market data", "Research & public data", "Community", "Other")
+                  "Market data", "Research & public data", "Jobs data", "Community", "Other")
 
 
 def get(service: str) -> OAuthProvider | None:
@@ -4084,6 +4263,63 @@ def credentials(provider: OAuthProvider) -> tuple[str, str]:
             f"TREG_{provider.client_secret_setting.upper()})"
         )
     return client_id, client_secret
+
+
+def platform_refresh_blob(service: str, method: str, blob: dict) -> dict | None:
+    """The blob to refresh one of treg's own connections with: the current client secret, sent only
+    to the provider's own token endpoint. None when the connection is not one of treg's apps, or when
+    its refresh sends no client secret."""
+    provider = REGISTRY.get(service or "")
+    if provider is None or not blob.get("refresh_include_client", True):
+        return None
+    try:
+        profile = provider.profile_for_authorization(method or "")
+    except ValueError:
+        return None
+    if not (profile.client_id_setting and profile.client_secret_setting and profile.token_uri):
+        return None
+    s = get_settings()
+    client_id = getattr(s, profile.client_id_setting, "") or ""
+    client_secret = getattr(s, profile.client_secret_setting, "") or ""
+    if not (client_id and client_secret) or blob.get("client_id") != client_id:
+        return None
+    return {**blob, "client_secret": client_secret, "token_uri": profile.token_uri}
+
+
+def appsecret_proof(profile: OAuthProvider, client_id: str, token: str, url: str) -> str | None:
+    """Meta's `appsecret_proof` for `token`, or None when none is owed.
+
+    Only for a profile that declares it, a token issued to treg's own configured app (a team's own
+    app keeps its own rules), and a request to that profile's own API hosts, so a blob or custom tool
+    a team controls can never have a proof computed for another destination.
+    """
+    if not (profile.appsecret_proof and client_id and token):
+        return None
+    hosts = {urlsplit(profile.base_url).hostname, urlsplit(profile.discovery_base).hostname}
+    if (urlsplit(str(url)).hostname or "").lower() not in hosts:
+        return None
+    s = get_settings()
+    app_secret = getattr(s, profile.client_secret_setting, "") or ""
+    if not app_secret or client_id != getattr(s, profile.client_id_setting, ""):
+        return None
+    return hmac.new(app_secret.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def connection_appsecret_proof(secret, binding: dict, raw: str, url: str) -> str | None:
+    """`appsecret_proof()` for the token an OAuth `binding` injects from `secret` (decrypted `raw`)."""
+    provider = REGISTRY.get(secret.provider or "")
+    if provider is None or secret.kind != "oauth" or binding.get("injector") != "oauth":
+        return None
+    try:
+        profile = provider.profile_for_authorization(secret.authorization_method or "")
+        blob = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    token = blob.get(binding.get("secret_field") or "access_token")
+    return appsecret_proof(profile, str(blob.get("client_id") or ""),
+                           token if isinstance(token, str) else "", url)
 
 
 def is_configured(provider: OAuthProvider) -> bool:

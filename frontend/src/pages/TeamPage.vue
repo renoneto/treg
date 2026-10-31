@@ -5,15 +5,35 @@ import Money from '../components/ui/Money.vue'
 import Avatar from '../components/ui/Avatar.vue'
 import TeamShowcase from './team/TeamShowcase.vue'
 import TeamAvatar from './team/TeamAvatar.vue'
+import EnterpriseSSO from '../components/EnterpriseSSO.vue'
 import { NO_KEY } from '../state/constants.js'
 import stripeSlate from '../assets/stripe-wordmark-slate.svg'
 import stripeWhite from '../assets/stripe-wordmark-white.svg'
 // The new agent's check-in poll lives as long as this page (state/agents.js).
 export default {
-  components: { InfoTip, Money, Avatar, TeamShowcase, TeamAvatar },
-  data: () => ({ NO_KEY, stripeSlate, stripeWhite }),
+  components: { InfoTip, Money, Avatar, TeamShowcase, TeamAvatar, EnterpriseSSO },
+  data: () => ({ NO_KEY, stripeSlate, stripeWhite, memberSsoReady: false }),
   setup: useDashboard,
-  mounted() { this.resumeCredentialIssue(); this.resumeAgentPoll() },
+  mounted() { this.resumeCredentialIssue(); this.resumeAgentPoll(); this.loadMemberSso() },
+  watch: {
+    activeOrgId() { this.loadMemberSso() },
+    orgTab(tab) { if (tab === 'sso' && this.activeRole !== 'owner') this.loadMemberSso() },
+  },
+  methods: {
+    async copyMemberSsoLink() {
+      const url = new URL(`/auth/sso/${encodeURIComponent(this.activeOrg.slug)}/start`, location.origin).href
+      this.orgMsg = await this.toClipboard(url) ? 'Employee sign-in link copied.' : 'Could not copy the sign-in link.'
+    },
+    async loadMemberSso() {
+      this.memberSsoReady = false
+      if (!this.activeOrgId || this.activeRole === 'owner') return
+      const orgId = this.activeOrgId
+      const status = await this.api(`/orgs/${orgId}/sso`).catch(() => null)
+      if (this.activeOrgId !== orgId || this.activeRole === 'owner') return
+      this.memberSsoReady = !!(status?.sso_ready && ['active', 'trialing', 'past_due'].includes(status.subscription_status))
+      if (!this.memberSsoReady && this.orgTab === 'sso') this.orgTab = 'keys'
+    },
+  },
   beforeUnmount() { this.parkCredentialIssue() },
 }
 </script>
@@ -23,7 +43,8 @@ export default {
           <div class="tut-head">
             <Avatar v-if="activeOrg && activeOrg.avatar_url" :src="activeOrg.avatar_url" :name="activeName" :size="40" />
             <div><h1>Team: {{activeName}}<span v-if="isPersonal(activeOrg)" class="chip" style="margin-left:8px;vertical-align:middle">personal</span></h1>
-              <p class="sub" style="margin:0">You are <b>{{activeRole}}</b> here. <span class="muted">Switch, create or join a team from the picker at the top of the page.</span></p></div>
+              <p class="sub" style="margin:0">You are <b>{{activeRole}}</b> here. <span class="muted">Switch, create or join a team from the picker at the top of the page.</span></p>
+              <button v-if="activeRole!=='owner' && memberSsoReady" class="btn sm" style="margin-top:8px" @click="copyMemberSsoLink">Copy company sign-in link</button></div>
           </div>
           <!-- settings for the ACTIVE team (switching lives in the sidebar) -->
           <div v-if="activeOrg" style="margin-top:20px">
@@ -34,14 +55,16 @@ export default {
               <button v-if="canAdmin" :class="{active:orgTab==='policy'}" @click="orgTab='policy'">Policy</button>
               <button v-if="canAdmin" :class="{active:orgTab==='billing'}" @click="orgTab='billing'">Billing</button>
               <button v-if="canAdmin" :class="{active:orgTab==='showcase'}" @click="orgTab='showcase'">Showcase</button>
+              <button v-if="activeRole==='owner' || memberSsoReady" :class="{active:orgTab==='sso'}" @click="orgTab='sso'">SSO</button>
               <button :class="{active:orgTab==='danger'}" @click="orgTab='danger'; resetRenameForm()">Team settings</button>
             </div>
-            <p v-if="!canAdmin && !['keys','danger'].includes(orgTab)" class="sub" style="margin-bottom:12px">Members, projects and policy are visible to admins.</p>
+            <p v-if="!canAdmin && !['keys','danger','sso'].includes(orgTab)" class="sub" style="margin-bottom:12px">Members, projects and policy are visible to admins.</p>
             <p v-if="myUsage && myUsage.cap>=0" class="sub" style="margin:-6px 0 12px">Your usage today: <b>{{myUsage.used_today}} / {{myUsage.cap}}</b> calls.</p>
             <div v-if="orgErr" class="banner">{{orgErr}}</div>
             <div v-if="orgMsg" class="tut-notice" style="margin-bottom:12px;display:flex;justify-content:space-between;gap:12px;align-items:flex-start">
               <span>{{orgMsg}}</span><button class="btn sm ico" @click="orgMsg=''" aria-label="Dismiss">✕</button>
             </div>
+            <EnterpriseSSO v-if="orgTab==='sso' && (activeRole==='owner' || memberSsoReady)" :org-id="activeOrg.org_id" :slug="activeOrg.slug" :owner="activeRole==='owner'" />
             <div v-if="credentialIssue" class="tut-notice" role="status" style="margin-bottom:12px">
               <template v-if="credentialIssue.status==='pending'">Your key request is in progress. You can switch teams and return here for the result. Keep this browser tab open.</template>
               <template v-else-if="credentialIssue.status==='checking'">Checking that your issued key is still active before showing it…</template>
@@ -406,11 +429,17 @@ export default {
 
                     <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
                       <div class="lbl">Payment history</div>
+                      <p class="sub" style="margin:8px 0 0">Top-ups add to your tool balance. SSO subscriptions are billed separately.</p>
+                      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px" role="group" aria-label="Filter payments">
+                        <button v-for="filter in [{id:'all',label:'All'},{id:'manual',label:'Manual top-ups'},{id:'auto',label:'Auto top-ups'},{id:'subscription',label:'Subscriptions'}]"
+                                :key="filter.id" class="btn sm" :class="{primary:bhistFilter===filter.id}"
+                                :aria-pressed="bhistFilter===filter.id" @click="setBillingHistoryFilter(filter.id)">{{filter.label}}</button>
+                      </div>
                       <p v-if="bhist.loading" class="sub" style="margin:8px 0 0">Loading…</p>
-                      <p v-else-if="!bhist.items.length" class="sub" style="margin:8px 0 0">No top-ups yet. Once you add funds, every payment shows up here with its documents.</p>
+                      <p v-else-if="bhist.error" class="sub" style="margin:8px 0 0">Could not load payment history. <button class="btn sm" @click="loadBillingHistory()">Try again</button></p>
+                      <p v-else-if="!bhist.items.length" class="sub" style="margin:8px 0 0">No payments in this category yet.</p>
                       <template v-else>
-                        <!-- Amounts come from our own ledger, so this list always agrees with the
-                             balance above. Only the links come from Stripe — hence the notice below. -->
+                        <!-- Top-up amounts come from our ledger; subscription invoices come from Stripe. -->
                         <div style="overflow-x:auto">
                         <table style="width:100%;min-width:440px;max-width:700px;margin-top:8px;border-collapse:collapse">
                           <thead><tr class="sub" style="text-align:left">
@@ -420,11 +449,13 @@ export default {
                             <th scope="col" style="padding:8px 0;text-align:right;font-weight:500">Documents</th>
                           </tr></thead>
                           <tbody>
-                          <tr v-for="i in bhist.items" :key="i.payment_intent" style="border-top:1px solid var(--line)">
+                          <tr v-for="i in bhist.items" :key="i.id" style="border-top:1px solid var(--line)">
                             <td style="padding:8px 10px 8px 0;white-space:nowrap">{{bhistDate(i.created_at)}}</td>
                             <td style="padding:8px 10px 8px 0;font-family:var(--mono);white-space:nowrap">{{money(i.amount_micro)}}</td>
                             <td style="padding:8px 10px 8px 0;white-space:nowrap" class="sub">
-                              {{i.auto?'Auto':'Manual'}} · <span style="color:var(--green)">Paid</span>
+                              {{i.kind==='subscription'?'SSO subscription':i.kind==='auto'?'Auto top-up':'Manual top-up'}} ·
+                              <span :style="i.status==='paid'?'color:var(--green)':''">{{i.status==='paid'?'Paid':i.status==='open'?'Payment due':i.status||'Pending'}}</span>
+                              <span v-if="i.kind==='subscription'&&i.number" class="muted"> · {{i.number}}</span>
                               <span v-if="i.bonus_micro" style="color:var(--green)"> +{{money(i.bonus_micro)}} bonus</span>
                             </td>
                             <td style="padding:8px 0;text-align:right;white-space:nowrap">
@@ -437,8 +468,14 @@ export default {
                           </tbody>
                         </table>
                         </div>
-                        <p v-if="!bhist.ok" class="sub" style="margin:8px 0 0">Document links are temporarily unavailable — the amounts above are correct. Try again shortly, or use <b>Manage billing</b> for the full archive.</p>
                       </template>
+                      <p v-if="!bhist.ok && bhist.items.length" class="sub" style="margin:8px 0 0">Some top-up document links are temporarily unavailable; the top-up amounts are correct. Try again or use <b>Manage billing</b>.</p>
+                      <p v-if="!bhist.invoicesOk" class="sub" style="margin:8px 0 0">Subscription invoices are temporarily unavailable. <button class="btn sm" @click="loadBillingHistory()">Try again</button></p>
+                      <div v-if="!bhist.error && (bhistPage>0 || bhist.nextCursor)" style="display:flex;justify-content:flex-end;gap:8px;align-items:center;margin-top:14px">
+                        <button class="btn sm" :disabled="bhistPage===0||bhist.loading" @click="previousBillingHistoryPage()">Previous</button>
+                        <span class="sub" style="margin:0">Page {{bhistPage+1}}</span>
+                        <button class="btn sm" :disabled="!bhist.nextCursor||bhist.loading" @click="nextBillingHistoryPage()">Next</button>
+                      </div>
                     </div>
                   </template>
 

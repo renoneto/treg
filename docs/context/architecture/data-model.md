@@ -31,6 +31,7 @@ sources:
   - src/treg/alembic/versions/0053_idempotentcall_membership_expires_index.py
   - src/treg/alembic/versions/0054_callrecord_org_id_id.py
   - src/treg/alembic/versions/0061_remove_redundant_unique_indexes.py
+  - src/treg/alembic/versions/0091_remove_prefix_covered_indexes.py
   - src/treg/alembic/versions/0034_managed_api_keys.py
   - src/treg/alembic/versions/0035_default_key_generation.py
   - src/treg/alembic/versions/0036_activity_key_indexes.py
@@ -59,6 +60,18 @@ sources:
   - src/treg/alembic/versions/0073_org_flow_control_version.py
   - tests/test_org_flow_control_schema.py
   - src/treg/alembic/versions/0075_ad_click_stash.py
+  - src/treg/alembic/versions/0079_enterprise_sso.py
+  - src/treg/alembic/versions/0082_oauth_sso_provenance.py
+  - src/treg/alembic/versions/0083_enterprise_sso_safety.py
+  - src/treg/alembic/versions/0084_enterprise_workos_cleanup.py
+  - src/treg/alembic/versions/0085_enterprise_sso_blocks.py
+  - src/treg/alembic/versions/0087_rankings_snapshot.py
+  - src/treg/alembic/versions/0088_call_usage_rollup.py
+  - src/treg/alembic/versions/0089_ledgerentry_settle_spend_index.py
+  - src/treg/alembic/versions/0090_ledgerentry_topup_index.py
+  - src/treg/application/call_usage_rollup.py
+  - src/treg/application/call_usage.py
+  - tests/test_call_usage_rollup.py
   - src/treg/timeutil.py
   - src/treg/infra/db.py
   - src/treg/infra/money_timing.py
@@ -96,6 +109,20 @@ related:
 Revision `0077` adds the empty `TeamDatabase` and `TableDoc` control-plane tables for
 [Workbench table storage](workbench-storage.md#management-metadata). It does not provision remote
 databases or business rows. Existing tables and data are unchanged by the migration.
+
+Migration `0079` adds `EnterpriseSSO` for a team's plan, subscription state, WorkOS organization,
+connection and directory; `EnterpriseSSOIdentity` for a stable team-specific SSO profile link;
+`EnterpriseDirectoryUser` for the directory roster, including users who have never signed in;
+and `EnterpriseSSOEvent` for WorkOS webhook deduplication. Team deletion removes the team-scoped
+rows before its `Org`, and active subscriptions block team deletion until canceled.
+Migration `0083` records whether SSO created a membership, makes an IdP subject unique within
+its team, reserves one pending enterprise Checkout per team, and marks keys issued under SSO
+enforcement. Existing keys have no SSO issuance proof and cannot enter an enforced team.
+Migration `0084` records when WorkOS cleanup completes. That marker keeps cancellation retries
+idempotent and prevents a new checkout while billable WorkOS resources may remain.
+Migration `0085` backfills and stores manual removal decisions separately from identity rows in minimal
+`EnterpriseSSOBlock` rows. Those rows survive connection cleanup, but leave with the team or
+the erased user; they contain no email or WorkOS identifiers.
 
 Migration `0043` adds `ProviderResource`, the durable organization-owned counterpart to the existing
 async ownership rows. It stores provider, resource kind, upstream id, display name, creator, source
@@ -195,9 +222,11 @@ An application rollback leaves the table in place; a schema downgrade deletes it
   against that team's call records or ledger. Revision `0025`; `domain.feedback` owns inserts;
   `application.feedback` commits. Team deletion removes these rows. See [feedback](feedback.md).
 - **`Media`** - a reference file a member hosted for a vendor to fetch (`treg host`): opaque
-  token, org, media type, size, the bytes, created and expiry. Revision `0037`;
-  `application.media` is the only writer and sweeps expired rows on each upload. Team deletion
-  removes these rows. See [media](media.md).
+  token, org, media type, size, the bytes (`body`) or the object-store key that holds them
+  (`object_key`), created and expiry. Revisions `0037`, `0092`; `application.media` is the only
+  writer and sweeps a batch of expired rows on each upload (their objects go by a background
+  deleter and the bucket lifecycle rule). Team deletion removes these
+  rows; their objects then name nothing and leave by the bucket's lifecycle rule. See [media](media.md).
 - **`FeedbackHandling` / `FeedbackHandlingEvent`** - internal current processing state and
   versioned history (revision 0030), owned by this schema and written only by the private admin
   service. Both cascade from the original report. See [feedback](feedback.md).
@@ -244,7 +273,7 @@ uses this metadata, never the encrypted token's shape.
   pair.** `ROLE_RANK` orders the roles.
 - **`ApiKey`** — a credential control row. It keeps `org_id`, nullable `membership_id`, the retained
   identity label, kind, name, safe prefix, optional unique SHA-256 hash, state, `default_generation`, lifecycle times,
-  creator, and replacement id. A human membership has one `default_human` row for signed identity
+  creator, replacement id, and optional SSO issuance team. A human membership has one `default_human` row for signed identity
   keys and can have many `additional_human` rows. A scoped agent has one current `agent` row.
   `legacy_human` rows keep old stored membership tokens working during the compatibility release;
   new human memberships leave the old token-hash field empty and do not create legacy rows.
@@ -361,7 +390,17 @@ uses this metadata, never the encrypted token's shape.
   `(org_id, id)`, and local runs, a sliver of a team's rows, read a partial
   `(org_id, created_at, id) WHERE kind = 'local_run'` (revision 0054); without them the first
   walked the primary key testing `org_id` and the second read the team's whole history. The
-  Activity feed's calls page by time on `(org_id, created_at)`.
+  Activity feed's calls page by time on `(org_id, created_at)`. A team's spend over a window
+  (`money.spend_since`, the Usage page and `/usage/by-tag` totals) reads a partial
+  `(org_id, created_at) INCLUDE (amount_micro) WHERE kind = 'settle'` on the ledger (revision 0089):
+  over `(org_id, created_at)` alone every row in the window cost a heap fetch, one random read per
+  row on a cold cache. The query states `'settle'` as a constant, since Postgres matches a partial
+  index only against one. A ledger too large to index within the revision's statement timeout gets
+  the same index built `CONCURRENTLY` out of band first; the revision then skips a valid one.
+  A team's top-ups (the auto top-up cap's month, the next default amount, the payments page's
+  auto flags, the invoice recovery boundary) read a partial `(org_id, created_at) WHERE kind =
+  'topup'` (revision 0090), with `'topup'` likewise a constant; before it Postgres intersected the
+  `org_id` and `kind` bitmaps and read every row of the team to find a handful.
 
   **Spend per API key is the ledger's, folded the same way.** Revision 0070 adds `ApiKeySpendDay`
   (team + API key + tool + UTC day -> `spent_micro`, `charges`; primary key
@@ -370,6 +409,29 @@ uses this metadata, never the encrypted token's shape.
   `recounted_on`). `application/key_spend_rollup.py`, run as `treg-worker spend rollup`, is the
   only writer of both, and the Team and Usage pages read only them; see [money](money.md) § Spend
   per API key. Team deletion clears a team's rows.
+
+  **Call counts per member are folded too.** The Usage page's counts and the observed-agents
+  roster grouped a team's whole 30-day window of `callrecord` per page open; the
+  `(org_id, created_at)` index finds the window, but every row is a heap fetch of a wide audit
+  row, and a busy team's report outlasted the report session's statement timeout. A covering
+  index was rejected: it would copy four string columns of every audit row and slow every audit
+  insert. Revision 0088 adds `CallUsageDay` (team + UTC day + member + kind + tool + client ->
+  `calls`, `last_at`) and the single-row `CallUsageCursor` (`cursor_id`, the last folded
+  `CallRecord.id`; `history_from`; `caught_up_at`). `application/call_usage_rollup.py`, run as
+  `treg-worker usage rollup`, is the only writer of both: it walks `callrecord` by primary key with
+  the commit lag of `catalog_stats`, starting at the first row of a 31-day history, and moves the
+  counts and the cursor in one transaction. The cursor lock is a no-op UPDATE, which also locks on
+  SQLite, where SELECT FOR UPDATE is ignored. A new cursor deletes the old day rows in the
+  transaction that creates it, so a rebuild never adds to a previous history. There is no recount: audit is lossy by design, and the
+  only race left undercounts by a row the queue could have shed anyway. A report
+  (`application/call_usage.py`) reads the folded rows and the team's rows after `cursor_id` in ONE
+  statement, so both halves share a snapshot and no row is counted twice or missed; the tail is
+  found over `(org_id, id)` and is a few minutes of calls while the cron runs. With no cursor row
+  (the worker never ran, e.g. a small self-hosted registry) the reports still aggregate
+  `callrecord` live; with a cursor that has not caught up they say usage is being prepared, and a
+  window older than `history_from` starts there and says so. The members and agents lists' `used_today`
+  reads today's rows the same way once the rollup has caught up, and `callrecord` live before that;
+  it never waits. `RunRecord` is still read live: it no longer grows. Team deletion clears a team's rows.
 
   **`ix_callrecord_call_ref`, and why a database could lack it.** The model and revision 0001
   declare it, so every database Alembic created has it. A database that predates Alembic got
@@ -449,7 +511,10 @@ uses this metadata, never the encrypted token's shape.
   `_store_idempotent` keeps a terminal 410 `idempotency_response_too_large` (`call_id`, charge,
   `size_bytes`) instead. The caller already received the full answer; a retry never runs again.
   The per-call expired-label sweep reads `(membership_id, expires_at)` (Alembic `0053`), so its
-  cost is the expired rows, not every label the caller holds.
+  cost is the expired rows, not every label the caller holds. It deletes at most
+  `IDEMPOTENCY_SWEEP_BATCH` rows it can lock (`FOR UPDATE SKIP LOCKED`), so a member's concurrent
+  batch never queues on one another's expired rows; a skipped row goes with a later call. The label
+  being reused is freed by the replay lookup's own delete, not by the sweep.
 - **`ToolRequest`** - a "the catalog doesn't have X" report (`POST /tool-requests`, open + per-IP
   rate-limited): `capability` (the headline, ≤200 chars), `query` (the search that came up empty -
   auto-filled by agents, the dedup/priority signal), `note`, `contact`, `source` (`web` | `cli` |
@@ -625,6 +690,16 @@ PostgreSQL drops each index concurrently in an autocommit block, with bounded ti
 afterward. A partial attempt can be retried. Downgrade rebuilds the ordinary indexes concurrently,
 repairing invalid build debris, and needs space for those indexes. No rows or foreign keys change.
 
+Revision `0091` applies the same discipline to single-column indexes that only repeat the leading
+column of a surviving composite index or unique constraint on the same table: `LedgerEntry.org_id`
+(served by `(org_id, created_at)`), `CallRecord.org_id` (`(org_id, created_at)`, `(org_id, id)`),
+`TagSpend.org_id` (`(org_id, dim, val, created_at)`), `ArchiveSnapshot.key_id`
+(`uq_archive_snapshot_version`) and `ArchiveKeyOrg.org_id` (`uq_archive_key_org`). Model metadata no
+longer declares them; the foreign keys stay. Its preflight requires each survivor to be a valid,
+unconditional btree whose first key column is the dropped one. Every drop is `IF EXISTS`, so a
+database whose indexes were dropped out of band with `DROP INDEX CONCURRENTLY IF EXISTS` before the
+deploy only records the revision.
+
 ## Audit writer (`audit.py`)
 
 `record_call` and `record_run` schedule best-effort writes through `background_session_maker`.
@@ -667,6 +742,11 @@ strands those events behind a cancelled flusher. The engine adds Postgres pool
 hygiene (`pool_pre_ping`/`pool_recycle`/sizing) for non-SQLite URLs, and `verify_db` refuses to start with
 no `TREG_SECRET_KEY` on a real DB (an ephemeral key would lose every stored secret on restart).
 
+`capture_quota_fail_open` uses the same flusher and shutdown drain for a bounded per-process
+60-second summary, rather than queuing one event per call. Its counts and capped target examples
+describe unconfirmed admissions, not a durable restriction audit; see
+[org-endpoint quotas](org-endpoint-quota.md#store-contract) for the event contract.
+
 `infra.money_timing.observe_money` measures the ordinary call's `reserve`, `close` and `deferred`
 application scopes with local monotonic timers. These cover optional money admission,
 pool acquisition and session cleanup,
@@ -700,7 +780,9 @@ database path. A reserve acquisition timeout instead records `rejected=1` in mod
 cleanup remains a cancellation, not a rejection or fallback. `reserve_admission` also emits one
 best-effort `money_admission_rejected` WARNING per refusal with the numeric `org_id`, operation,
 reason and jittered `retry_after_s`; org IDs remain out of aggregate dimensions. Release and
-settlement timeouts still record mode `fallback`. A Redis lease serializes admitted same-org
+settlement record mode `fallback` with `fallback_wait_timeout` only when their wider budget
+(twice the lease, at most half the hold grace) expires; a settlement that waited past the reserve budget and then got the lease
+records mode `redis`, its whole wait in `wait_*`. A Redis lease serializes admitted same-org
 balance work; reserve timeout rejection keeps those expired waiters out of the funds transaction.
 
 `money_admission_reporting.emit_snapshot` writes one local JSON record and queues one PostHog event
@@ -998,6 +1080,14 @@ length-capped click fields, and `created_at`/`updated_at` use naive UTC. Authent
 submit observations of proven emails; cookie-less signup uses observations from the last 90 days.
 Signup deletes the row once its team holds the click, and `treg-worker admin purge-ad-clicks`
 deletes rows past 90 days. No analytics or audit emission is involved. See [ads conversions](ads-conversions.md).
+
+## Rankings
+
+Additive revision `0087`: `rankingssnapshot`, one row (`id = "current"`) holding every /rankings
+board as JSON, the newest complete UTC day it covers (`through`) and when it was built. Written only
+by `application.rankings.refresh` (the `treg-worker rankings refresh` cron), which replaces the row
+whole; the page reads it. It holds counts, rates and durations per tool and endpoint, never a team,
+a key or money, so team deletion has nothing to remove. See [catalog](catalog.md).
 
 ## Showcase leaderboard and pictures
 
