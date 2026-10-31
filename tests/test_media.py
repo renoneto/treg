@@ -199,7 +199,9 @@ async def test_expiry_sweep_deletes_the_object_too(clients: AsyncClient, bucket)
         await db.commit()
     assert (await clients.get(f"/m/{tok}")).status_code == 404
     await clients.post("/media", content=PNG, headers={"content-type": "image/png"})
-    assert await _row(tok) is None and key not in bucket.objects and len(bucket.objects) == 1
+    assert await _row(tok) is None
+    await media_app.drain()  # objects are deleted off the request path
+    assert key not in bucket.objects and len(bucket.objects) == 1
 
 
 async def test_a_missing_object_is_404_and_an_unreachable_bucket_503(clients: AsyncClient, bucket):
@@ -207,6 +209,8 @@ async def test_a_missing_object_is_404_and_an_unreachable_bucket_503(clients: As
     bucket.fail = True
     assert (await clients.get(f"/m/{tok}")).status_code == 503
     assert (await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).status_code == 503
+    async with session_maker() as db:  # the failed upload left no row behind
+        assert (await db.execute(Media.__table__.select())).all() == [await _row(tok)]
     bucket.fail = False
     bucket.objects.clear()
     assert (await clients.get(f"/m/{tok}")).status_code == 404
@@ -219,3 +223,41 @@ async def test_r2_mode_without_a_bucket_refuses_at_startup_and_on_upload(clients
         media_app.validate_configuration()
     r = await clients.post("/media", content=PNG, headers={"content-type": "image/png"})
     assert r.status_code == 503
+
+
+@pytest.mark.parametrize("mode", ["db", "r2"])
+async def test_concurrent_uploads_stay_within_the_daily_quota(clients: AsyncClient, bucket, monkeypatch, mode):
+    monkeypatch.setattr(get_settings(), "media_body_write", mode)
+    monkeypatch.setattr(media_app, "DAILY_ORG_BYTES", 250)
+    results = await asyncio.gather(*(clients.post("/media", content=b"x" * 100, headers={"content-type": "audio/mpeg"})
+                                     for _ in range(6)))
+    assert sorted(r.status_code for r in results) == [201, 201, 429, 429, 429, 429]
+    async with session_maker() as db:
+        assert len((await db.execute(Media.__table__.select())).all()) == 2
+    assert len(bucket.objects) == (2 if mode == "r2" else 0)
+
+
+async def test_each_upload_sweeps_a_bounded_batch(clients: AsyncClient, bucket, monkeypatch):
+    monkeypatch.setattr(media_app, "SWEEP_BATCH", 2)
+    toks = [(await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).json()["token"]
+            for _ in range(5)]
+    async with session_maker() as db:
+        await db.execute(update(Media).values(expires_at=_now() - timedelta(seconds=1)))
+        await db.commit()
+    await clients.post("/media", content=PNG, headers={"content-type": "image/png"})
+    await media_app.drain()
+    left = [t for t in toks if await _row(t) is not None]
+    assert len(left) == 3 and len(bucket.objects) == 4  # 3 expired left + the new upload
+
+
+async def test_db_mode_never_touches_the_bucket(clients: AsyncClient, bucket, monkeypatch):
+    tok = (await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).json()["token"]
+    async with session_maker() as db:
+        await db.execute(update(Media).where(Media.token == tok).values(expires_at=_now() - timedelta(seconds=1)))
+        await db.commit()
+    monkeypatch.setattr(get_settings(), "media_body_write", "db")
+    calls = []
+    monkeypatch.setattr(bucket, "_io", lambda: calls.append(1))
+    assert (await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).status_code == 201
+    await media_app.drain()
+    assert await _row(tok) is None and calls == []  # the expired row's object is left to the lifecycle rule

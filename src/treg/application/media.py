@@ -12,6 +12,8 @@ Bytes go to the archive's bucket under a random `hosted-media/v1/<hex>` key when
 is "r2", else into the row. No database connection is held while the bucket is read or written
 (AGENTS.md rule 3): each database step opens and closes its own session around the storage I/O.
 """
+import asyncio
+from collections import deque
 from collections.abc import AsyncIterator
 from datetime import timedelta
 import logging
@@ -36,6 +38,13 @@ DENIED_TYPES = frozenset({"image/svg+xml", "image/svg"})
 
 
 KEY_PREFIX = "hosted-media/v1/"
+SWEEP_BATCH = 100        # expired rows removed per upload; each upload adds one
+DELETE_QUEUE_MAX = 1000  # swept objects waiting for the background deleter
+DELETE_RUN_S = 60.0      # one deleter run's budget
+_QUOTA_LOCK = 0x6D656469  # pg_advisory_xact_lock namespace: "medi"
+
+_delete_queue: deque[str] = deque()
+_deleter: asyncio.Task | None = None
 
 _store_override: object_store.StreamedObjectStore | None = None
 _store_cache: tuple[tuple, object_store.StreamedObjectStore | None] | None = None
@@ -93,50 +102,87 @@ async def put(*, org_id: int, body: bytes, content_type: str) -> Media:
     if to_store and st is None:
         raise MediaRejected(503, "media storage is not configured")
     now = _now()
-    async with session_maker() as db:
-        # ponytail: expiry is swept inline on every upload rather than by a cron; a dedicated
-        # sweep only matters once uploads are rare and the table is not.
-        swept = (await db.execute(delete(Media).where(Media.expires_at < now)
-                                  .returning(Media.object_key))).scalars().all()
-        # ponytail: read-then-insert, so two concurrent uploads can overshoot the quota by one file;
-        # a row lock per org is the upgrade if the courtesy ever gets abused.
-        used = (await db.execute(select(func.coalesce(func.sum(Media.size), 0)).where(
-            Media.org_id == org_id, Media.created_at >= now - timedelta(days=1)))).scalar_one()
-        await db.commit()
-    await _delete_objects([key for key in swept if key])
-    if used + len(body) > DAILY_ORG_BYTES:
-        raise MediaRejected(429, f"this team has hosted {used} bytes in the last 24 h; the daily quota is {DAILY_ORG_BYTES}")
-    key = None
-    if st is not None:
-        key = KEY_PREFIX + secrets.token_hex(32)
-        try:
-            await st.put_named(key, body)
-        except object_store.ObjectStoreError as exc:
-            log.warning("media upload failed reason=%s", exc.reason)
-            raise MediaRejected(503, "media storage is unavailable; try again") from None
+    swept = await _sweep(now)
+    if to_store:
+        _queue_deletes(swept)
+    key = KEY_PREFIX + secrets.token_hex(32) if to_store else None
     row = Media(token=secrets.token_urlsafe(24), org_id=org_id, content_type=ctype, size=len(body),
                 body=None if key else body, object_key=key, created_at=now, expires_at=now + TTL)
+    async with session_maker() as db:
+        if db.get_bind().dialect.name == "postgresql":
+            # One upload per team at a time between the insert and the quota sum, so concurrent
+            # uploads cannot all pass the check. SQLite serializes the insert's write lock instead.
+            await db.execute(select(func.pg_advisory_xact_lock(_QUOTA_LOCK, org_id)))
+        db.add(row)
+        await db.flush()
+        used = (await db.execute(select(func.coalesce(func.sum(Media.size), 0)).where(
+            Media.org_id == org_id, Media.created_at >= now - timedelta(days=1)))).scalar_one()
+        if used > DAILY_ORG_BYTES:
+            await db.rollback()
+            raise MediaRejected(429, f"this team has hosted {used - len(body)} bytes in the last 24 h; "
+                                     f"the daily quota is {DAILY_ORG_BYTES}")
+        await db.commit()
+    if key is None:
+        return row  # every field the router answers with was set above; no re-read of the body
+    # The row exists before its object does, but its token is returned only after the PUT: no URL
+    # can reach the row in between. A failed PUT removes the row and leaves any partial object to
+    # the bucket's lifecycle rule.
     try:
+        await st.put_named(key, body)
+    except BaseException as exc:
         async with session_maker() as db:
-            db.add(row)
+            await db.execute(delete(Media).where(Media.id == row.id))
             await db.commit()
-    except Exception:
-        if key:
-            await _delete_objects([key])
+        if isinstance(exc, object_store.ObjectStoreError):
+            log.warning("media upload failed reason=%s", exc.reason)
+            raise MediaRejected(503, "media storage is unavailable; try again") from None
         raise
-    return row  # every field the router answers with was set above; no re-read of the body
+    return row
 
 
-async def _delete_objects(keys: list[str]) -> None:
-    """Best effort: an object left behind is removed by the bucket's lifecycle rule on KEY_PREFIX."""
-    st = store()
-    if not keys or st is None:
+async def _sweep(now) -> list[str]:
+    """Delete one bounded batch of expired rows in its own transaction; returns their object keys."""
+    async with session_maker() as db:
+        expired = (select(Media.id).where(Media.expires_at < now).order_by(Media.expires_at)
+                   .limit(SWEEP_BATCH).with_for_update(skip_locked=True).cte("expired_media")
+                   .prefix_with("MATERIALIZED", dialect="postgresql"))
+        swept = (await db.execute(delete(Media).where(Media.id.in_(select(expired.c.id)))
+                                  .returning(Media.object_key)
+                                  .execution_options(synchronize_session=False))).scalars().all()
+        await db.commit()
+    return [key for key in swept if key]
+
+
+def _queue_deletes(keys: list[str]) -> None:
+    """Hand swept objects to one background deleter, off the request path. Bounded by queue length
+    and by time per run; what does not fit is left to the bucket's lifecycle rule on KEY_PREFIX."""
+    global _deleter
+    room = DELETE_QUEUE_MAX - len(_delete_queue)
+    _delete_queue.extend(keys[:max(room, 0)])
+    if not _delete_queue or (_deleter is not None and not _deleter.done()):
         return
-    for key in keys:
-        try:
-            await st.delete_named(key)
-        except object_store.ObjectStoreError as exc:
-            log.warning("media object delete failed reason=%s", exc.reason)
+    _deleter = asyncio.get_running_loop().create_task(_run_deletes())
+
+
+async def _run_deletes() -> None:
+    st = store()
+    try:
+        async with asyncio.timeout(DELETE_RUN_S):
+            while _delete_queue and st is not None:
+                key = _delete_queue.popleft()
+                try:
+                    await st.delete_named(key)
+                except object_store.ObjectStoreError as exc:
+                    log.warning("media object delete failed reason=%s", exc.reason)
+    except TimeoutError:
+        log.warning("media object deletes left to the lifecycle rule count=%d", len(_delete_queue))
+    _delete_queue.clear()
+
+
+async def drain() -> None:
+    """Tests: wait for the background deleter."""
+    if _deleter is not None:
+        await asyncio.gather(_deleter, return_exceptions=True)
 
 
 async def get(token: str) -> Media | None:

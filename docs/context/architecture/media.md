@@ -38,9 +38,12 @@ to land one 18 s Seedance task was the cost on 2026-09-14. `treg host <file>` re
   `image/*`, `audio/*`, `video/*`, with SVG denied (an image type that carries script). Sandbox
   orgs are refused. The router refuses on `Content-Length` and again mid-stream at the cap, so an
   oversized body never reaches worker RAM in full.
-- Expiry is swept inline on every upload (`DELETE WHERE expires_at < now`, returning the swept
-  rows' object keys, whose objects are then deleted) rather than by a cron; an expired row also
-  404s on read before the sweep reaches it.
+- Expiry is swept inline on every upload rather than by a cron: one bounded batch
+  (`SWEEP_BATCH`, oldest first, `SKIP LOCKED`) per upload in its own transaction; each upload adds
+  one row, so the sweep keeps up. An expired row also 404s on read before the sweep reaches it.
+- The daily quota is exact under concurrency: the new row is inserted and the team's 24 h sum
+  (which includes it) is read in one transaction, serialized per team by a Postgres advisory lock
+  (SQLite serializes the insert's write lock), and an upload past the quota rolls back.
 - Not metered. Hosting is a courtesy like polling, so money's five entries stay untouched and the
   call runtime never touches this table.
 
@@ -62,19 +65,26 @@ expiry writes and frees whole files in the database, which is what the move to t
 row's size as `Content-Length`; an object whose size differs from the row's answers 503, a
 missing one 404, an unreachable bucket 503 with `Retry-After`. A row with a `body` is served from
 it in either mode, so switching to `r2` needs no backfill (database rows leave by TTL) and switching
-back keeps serving the objects while the bucket stays configured. Upload order is: sweep and quota
-check in one session, then the object PUT with no session open, then the row insert in its own
-session (a failed insert deletes the object it just wrote). No database connection is held while
-the bucket is read or written (AGENTS.md rule 3); `tests/test_media.py` checks it at the SDK seam.
+back keeps serving the objects while the bucket stays configured.
 
-Object deletion on expiry is best effort: a failed delete, a crash between PUT and insert, or a
-switch back to `db` with the bucket unconfigured can leave an object no row names, and team
-deletion removes a team's rows without touching the bucket. Such an object is unreachable (no row,
-so no URL serves it). Give the bucket a
-lifecycle rule that deletes `hosted-media/` objects some days past the TTL; nothing else cleans
-those. Once a deployment has switched, the table's disk space comes back only after the database
-rows have expired and the table has been rewritten (a repack or `VACUUM FULL`); plain vacuum makes
-the space reusable but does not return it.
+Upload order in `r2`: the sweep's transaction; then the quota transaction, which inserts the row
+with its `object_key` and no `body`; then the object PUT with no session open. The token is
+returned only after the PUT, so no URL reaches the row in between; a failed PUT deletes the row.
+No database connection is held while the bucket is read or written (AGENTS.md rule 3);
+`tests/test_media.py` checks it at the SDK seam.
+
+Swept rows' objects are deleted off the request path, by one background deleter per process,
+bounded by queue length (`DELETE_QUEUE_MAX`) and time per run (`DELETE_RUN_S`). In `db` mode the
+upload path never touches the bucket: swept rows' objects are not deleted there. So objects no row
+names are expected: overflow or a failed delete, a run past its budget, a sweep in `db` mode, a
+cancelled upload, and team deletion (which removes a team's rows without touching the bucket).
+Such an object is unreachable, since no row means no URL serves it. **The bucket's lifecycle rule on
+`hosted-media/` is what guarantees deletion**: give the bucket one that deletes those objects
+some days past the TTL; the deleter only makes them go sooner.
+
+Once a deployment has switched, the table's disk space comes back only after the database rows
+have expired and the table has been rewritten (a repack or `VACUUM FULL`); plain vacuum makes the
+space reusable but does not return it.
 
 ## Not built
 
