@@ -5155,16 +5155,23 @@ endpoints:
     host: gate.crawl4ai.com
     path: /lead/company
     name: Company enrichment by domain
-    summary: 'Enrich a company from its domain: name, description, industry, employee count (the people on record),
-      LinkedIn company URL, logo, website technology stack, the work e-mails and phones published on its pages, its
-      social links and mail provider. `domain` is the company''s website (stripe.com). A domain not on record answers
-      404, free. About 0.2 s.'
+    summary: 'Enrich a company from its domain or LinkedIn company page: name, description, industry, employee count
+      (the people on record), LinkedIn company URL, logo, website technology stack, the work e-mails and phones
+      published on its pages, its social links and mail provider. `domain` is the company''s website (stripe.com);
+      `linkedin` is its LinkedIn page link or handle (when several domains share the page, the most asked one answers
+      and meta.also_on_this_linkedin_page lists the rest). A company not on record answers 404, free. About 0.2 s.'
     input:
       queryParams:
         domain:
           type: string
-          required: true
+          required: false
           example: stripe.com
+          note: one of domain or linkedin
+        linkedin:
+          type: string
+          required: false
+          example: https://www.linkedin.com/company/stripe/
+          note: a LinkedIn company page link or handle
     strict_query: true
     cost:
       type: per_success
@@ -5200,7 +5207,8 @@ endpoints:
     summary: 'People search by company domain and job title, one row per person: name, job title, LinkedIn profile,
       work e-mail when one is published (with its kind and status), department, seniority and decision role, the
       page they were found on, and the company''s facts. Search by company (`where.company.domain`), by job title
-      through department and seniority (department: marketing, sales, engineering,
+      (`where.person.title`: words in any order, VP = Vice President, Head = Director), by department or seniority
+      (department: marketing, sales, engineering,
       product, finance, hr, operations, legal, it, design, executive; seniority: owner_founder, c_level, vp, director,
       manager; decision_role for decision makers), by a person''s name (`where.person.name`), by company country,
       city or industry, or by a free-text brief (`q`). `limit` is how many people (default 10, up to 100), one
@@ -5213,7 +5221,7 @@ endpoints:
           type: object
           required: false
           example: {company: {domain: stripe.com}, person: {department: [engineering]}}
-          note: "company: domain, country, city, industry; person: name, seniority, department, decision_role; `title` is an exact phrase, so send a role as seniority + department"
+          note: "company: domain, country, city, industry; person: title, name, seniority, department, decision_role"
         q:
           type: string
           required: false
