@@ -76,6 +76,7 @@ from sqlalchemy import event  # noqa: E402
 
 from treg.config import get_settings  # noqa: E402
 from treg.infra import db as infra_db  # noqa: E402
+from treg.infra import object_store  # noqa: E402
 from treg.infra.object_store import R2ObjectStore  # noqa: E402
 
 
@@ -261,3 +262,21 @@ async def test_db_mode_never_touches_the_bucket(clients: AsyncClient, bucket, mo
     assert (await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).status_code == 201
     await media_app.drain()
     assert await _row(tok) is None and calls == []  # the expired row's object is left to the lifecycle rule
+
+
+async def test_a_failed_put_removes_only_its_own_row_even_when_the_id_was_reused(clients: AsyncClient, bucket, monkeypatch):
+    st = media_app.store()
+
+    async def reused_then_failed(name, body):
+        # The pending row is deleted (its team deleted) and SQLite hands its id to a new upload.
+        async with session_maker() as db:
+            pending = (await db.execute(Media.__table__.select())).one()
+            await db.execute(Media.__table__.delete())
+            await db.execute(Media.__table__.insert().values(
+                id=pending.id, token="someone-else", org_id=pending.org_id, content_type="image/png",
+                size=len(PNG), body=PNG, created_at=pending.created_at, expires_at=pending.expires_at))
+            await db.commit()
+        raise object_store.ObjectStoreError("store_error")
+    monkeypatch.setattr(st, "put_named", reused_then_failed)
+    assert (await clients.post("/media", content=PNG, headers={"content-type": "image/png"})).status_code == 503
+    assert (await clients.get("/m/someone-else")).content == PNG

@@ -131,7 +131,8 @@ async def put(*, org_id: int, body: bytes, content_type: str) -> Media:
         await st.put_named(key, body)
     except BaseException as exc:
         async with session_maker() as db:
-            await db.execute(delete(Media).where(Media.id == row.id))
+            # By token too: SQLite may reuse the id if the team was deleted during the PUT.
+            await db.execute(delete(Media).where(Media.id == row.id, Media.token == row.token))
             await db.commit()
         if isinstance(exc, object_store.ObjectStoreError):
             log.warning("media upload failed reason=%s", exc.reason)
