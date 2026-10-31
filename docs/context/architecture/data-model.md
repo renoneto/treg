@@ -222,7 +222,7 @@ An application rollback leaves the table in place; a schema downgrade deletes it
   `application.feedback` commits. Team deletion removes these rows. See [feedback](feedback.md).
 - **`Media`** - a reference file a member hosted for a vendor to fetch (`treg host`): opaque
   token, org, media type, size, the bytes (`body`) or the object-store key that holds them
-  (`object_key`), created and expiry. Revisions `0037`, `0091`; `application.media` is the only
+  (`object_key`), created and expiry. Revisions `0037`, `0092`; `application.media` is the only
   writer and sweeps expired rows, and their objects, on each upload. Team deletion removes these
   rows; their objects then name nothing and leave by the bucket's lifecycle rule. See [media](media.md).
 - **`FeedbackHandling` / `FeedbackHandlingEvent`** - internal current processing state and

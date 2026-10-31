@@ -7,7 +7,7 @@ sources:
   - src/treg/models.py
   - src/treg/infra/object_store.py
   - src/treg/alembic/versions/0037_media_hosting.py
-  - src/treg/alembic/versions/0091_media_object_key.py
+  - src/treg/alembic/versions/0092_media_object_key.py
   - tests/test_media.py
 related:
   - architecture/archive.md

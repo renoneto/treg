@@ -1,7 +1,7 @@
 """media: `object_key` names a body kept in the object store; `body` becomes nullable
 
-Revision ID: 0091
-Revises: 0090
+Revision ID: 0092
+Revises: 0091
 Create Date: 2026-10-31
 
 A row with `object_key` set has no `body`: its bytes live in the archive's bucket
@@ -19,8 +19,8 @@ import sqlalchemy as sa
 import sqlmodel
 
 
-revision: str = "0091"
-down_revision: str | Sequence[str] | None = "0090"
+revision: str = "0092"
+down_revision: str | Sequence[str] | None = "0091"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 contract = True  # body loses NOT NULL; see the rollback floor note
