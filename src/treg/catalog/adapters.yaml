@@ -2706,11 +2706,13 @@ adapters:
     out: {people: people, count: total_entries}
     miss: "coalesce(people, []) == []"
   crawl4ai.people.search:
-    accepts: [[title, company_domain], [company_domain]]
-    in: {company_domain: body.where.company.domain}
+    accepts: [[title, company_domain], [company_domain], [title], [full_name], [q]]
+    in: {company_domain: body.where.company.domain, title: body.where.person.seniority, full_name: body.where.person.name, q: body.q}
     in_expr:
       body.where.person.seniority: "role_seniority(title)"
       body.where.person.department: "role_department(title)"
+      body.where.company.country: "upper(country)"
+      body.where.company.city: location
       body.limit: limit
     max: {limit: 100}
     out: {people: data, count: "len(data)"}

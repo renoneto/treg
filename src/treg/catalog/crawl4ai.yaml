@@ -5154,11 +5154,11 @@ endpoints:
     method: GET
     host: gate.crawl4ai.com
     path: /lead/company
-    name: A company by its domain
-    summary: 'One company from its domain, as Crawl4AI Lead knows it: name, description, industry, LinkedIn slug,
-      logo, the e-mails and phones published on its pages, its social links, the technology it runs, its mail provider
-      and how many of its people Lead holds. `domain` is the company''s site (stripe.com). A domain Lead does not have
-      answers 404, free. About 0.2 s.'
+    name: Company enrichment by domain
+    summary: 'Enrich a company from its domain: name, description, industry, employee count (the people on record),
+      LinkedIn company URL, logo, website technology stack, the work e-mails and phones published on its pages, its
+      social links and mail provider. `domain` is the company''s website (stripe.com). A domain not on record answers
+      404, free. About 0.2 s.'
     input:
       queryParams:
         domain:
@@ -5196,22 +5196,28 @@ endpoints:
     method: POST
     host: gate.crawl4ai.com
     path: /lead/people/search
-    name: People at a company
-    summary: 'The people Crawl4AI Lead holds at a company, one row per person: name, title, LinkedIn slug, the
-      page they were found on, an e-mail when one is published (with its kind and status), the department and
-      decision role Lead read from the title, and the company''s facts. `where.company.domain` is the company''s site;
-      `where.person.department` and `where.person.seniority` narrow by role (department: marketing, sales,
-      engineering, product, finance, hr, operations, legal, it, design, executive; seniority: owner_founder, c_level,
-      vp, director, manager); `limit` is how many people (default 10, up to 100), one price a call at any limit.
-      An empty answer is free. About 0.2 s.'
+    name: Find people at a company by job title
+    summary: 'People search by company domain and job title, one row per person: name, job title, LinkedIn profile,
+      work e-mail when one is published (with its kind and status), department, seniority and decision role, the
+      page they were found on, and the company''s facts. Search by company (`where.company.domain`), by job title
+      through department and seniority (department: marketing, sales, engineering,
+      product, finance, hr, operations, legal, it, design, executive; seniority: owner_founder, c_level, vp, director,
+      manager; decision_role for decision makers), by a person''s name (`where.person.name`), by company country,
+      city or industry, or by a free-text brief (`q`). `limit` is how many people (default 10, up to 100), one
+      price a call at any limit. An empty answer is free. About 0.2 s.'
     body_allowlist: true
     input:
       bodyType: json
       body:
         where:
           type: object
-          required: true
+          required: false
           example: {company: {domain: stripe.com}, person: {department: [engineering]}}
+          note: "company: domain, country, city, industry; person: name, seniority, department, decision_role; `title` is an exact phrase, so send a role as seniority + department"
+        q:
+          type: string
+          required: false
+          note: a free-text brief instead of `where` ("marketing leaders at fintech companies in London")
         limit:
           type: integer
           required: false
