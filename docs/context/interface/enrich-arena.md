@@ -287,13 +287,24 @@ remains unresolved; newer different answers never substitute for historical evid
 CTE requires SQLAlchemy 2.0.42 or newer, reflected in the server dependency floor.
 `ArenaInsightState` serializes the cursor across workers and stores the aggregate;
 partial initial history is withheld until the first pass completes; a previous completed publication
-remains visible during a version-triggered rebuild. Steady state refreshes about every two
-minutes (plus collection time), allowing one minute for audit/archive writes and revisiting ten minutes
-of recent evidence. The first backfill may take longer. Evidence that arrives later than this revisit
-window remains unresolved until a version-triggered rebuild; lossy audit cannot establish complete traffic.
+remains visible during a version-triggered rebuild. Once caught up, collection keeps pace every
+two minutes and the aggregate republishes every `REFRESH_SECONDS`, allowing one minute for
+audit/archive writes and revisiting ten minutes of recent evidence. The first backfill may take
+longer. Evidence that arrives later than this revisit window remains unresolved until a
+version-triggered rebuild; lossy audit cannot establish complete traffic.
 
-The source window is 30 days, with old facts pruned. Rule, adapter or contract changes produce a new
-version/cursor and rebuild from available evidence. PostgreSQL computes medians and unique-request
+The version (the `ArenaInsightState` id and `ArenaObservation.version`) is a hash of
+`domain.arena_insights.RULES_VERSION` and `domain.arena.VERSION` only; bump one of them when
+classification changes and the collector rebuilds from available evidence. It used to hash every
+Arena endpoint's path, adapter and contract as well, and the catalog changes several times a day,
+so the cursor restarted its 30-day walk on each change, never caught up and never republished.
+The endpoint set is applied when aggregating instead: facts of an endpoint that left the Arena drop
+out at the next publication; an endpoint that joins counts from calls after the cursor; an
+adapter edit applies to calls classified after it, older facts age out of the window.
+`prune`, at the start of every `drain` pass whether or not there is backlog, deletes the current
+version's facts older than the window being collected and every fact of a superseded version, and
+deletes superseded state rows once the current version has a ready payload (until then they are the
+fallback above). PostgreSQL computes medians and unique-request
 counts in SQL; local SQLite uses an exact Python median. The collector owns writes to the two new
 tables, created by Alembic revision `0028`. Run `python -m treg upgrade` before restarting the app.
 A refresh failure retains the last aggregate and its original timestamp; partial collection is never
